@@ -1,0 +1,15 @@
+.venv/
+.tools/
+artifacts/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3

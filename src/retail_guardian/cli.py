@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+
+from retail_guardian.evaluation import BenchmarkEvaluator
+from retail_guardian.investigation import InvestigationAgent
+from retail_guardian.providers import HeuristicInvestigationModel, OpenAIInvestigationModel
+from retail_guardian.scenarios import SCENARIOS, run_scenario
+from retail_guardian.storage import SQLiteHistoryRepository
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="retail-guardian",
+        description="Run reproducible retail data-pipeline scenarios.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run_parser = subparsers.add_parser("run", help="Generate and execute a pipeline scenario")
+    run_parser.add_argument("--scenario", choices=SCENARIOS, default="healthy")
+    run_parser.add_argument("--rows", type=int, default=500)
+    run_parser.add_argument("--seed", type=int, default=42)
+    run_parser.add_argument(
+        "--as-of",
+        type=_parse_datetime,
+        default=None,
+        help="ISO-8601 reference time (default: current UTC time)",
+    )
+    run_parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
+    run_parser.add_argument("--database", type=Path, default=None)
+    subparsers.add_parser("list-scenarios", help="List available example scenarios")
+    investigate_parser = subparsers.add_parser(
+        "investigate", help="Autonomously investigate a persisted incident"
+    )
+    investigate_parser.add_argument("--incident-id", required=True)
+    investigate_parser.add_argument("--database", type=Path, default=Path("artifacts/history.db"))
+    investigate_parser.add_argument("--provider", choices=("mock", "openai"), default="mock")
+    investigate_parser.add_argument("--model", default=None)
+    investigate_parser.add_argument("--max-tool-calls", type=int, default=8)
+    investigate_parser.add_argument("--output", type=Path, default=None)
+    benchmark_parser = subparsers.add_parser(
+        "benchmark", help="Evaluate investigations against hidden synthetic ground truth"
+    )
+    benchmark_parser.add_argument("--database", type=Path, default=Path("artifacts/benchmark.db"))
+    benchmark_parser.add_argument("--provider", choices=("mock", "openai"), default="mock")
+    benchmark_parser.add_argument("--model", default=None)
+    benchmark_parser.add_argument("--rows", type=int, default=500)
+    benchmark_parser.add_argument("--seed", type=int, default=42)
+    benchmark_parser.add_argument("--max-tool-calls", type=int, default=8)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "list-scenarios":
+        print("\n".join(SCENARIOS))
+        return 0
+    if args.command == "investigate":
+        return _run_investigation(args)
+    if args.command == "benchmark":
+        return _run_benchmark(args)
+
+    as_of = args.as_of or datetime.now(UTC)
+    output_dir: Path = args.output_dir
+    database = args.database or output_dir / "history.db"
+    repository = SQLiteHistoryRepository(database)
+    try:
+        run = run_scenario(
+            args.scenario,
+            row_count=args.rows,
+            seed=args.seed,
+            as_of=as_of,
+            repository=repository,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    report_path = output_dir / f"{args.scenario}-incident.json"
+    run.report.write(report_path)
+    if run.aggregates is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        run.aggregates.to_csv(output_dir / f"{args.scenario}-aggregates.csv", index=False)
+
+    print(run.report.to_json())
+    print(f"Report written to {report_path}", file=sys.stderr)
+    return 0 if run.report.status == "healthy" else 1
+
+
+def _run_investigation(args: argparse.Namespace) -> int:
+    try:
+        repository = SQLiteHistoryRepository(args.database)
+        model = _build_model(args.provider, args.model)
+        report = InvestigationAgent(
+            repository, model, max_tool_calls=args.max_tool_calls
+        ).investigate(args.incident_id)
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.output:
+        report.write(args.output)
+    print(report.to_json())
+    return 0 if report.status == "completed" else 1
+
+
+def _run_benchmark(args: argparse.Namespace) -> int:
+    try:
+        repository = SQLiteHistoryRepository(args.database)
+
+        def agent_factory() -> InvestigationAgent:
+            return InvestigationAgent(
+                repository,
+                _build_model(args.provider, args.model),
+                max_tool_calls=args.max_tool_calls,
+            )
+
+        summary = BenchmarkEvaluator(repository, agent_factory).run(
+            row_count=args.rows,
+            seed=args.seed,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def _build_model(provider: str, model_name: str | None):
+    if provider == "openai":
+        return OpenAIInvestigationModel(model_name)
+    return HeuristicInvestigationModel()
+
+
+def _parse_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError("--as-of must include a timezone")
+    return parsed
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

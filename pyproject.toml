@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "retail-pipeline-guardian"
+version = "0.2.0"
+description = "Autonomous retail data-pipeline incident detection and investigation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0,<3.0",
+    "pandas>=2.2,<3.0",
+    "langgraph>=1.0,<2.0",
+    "openai>=2.0,<3.0",
+    "pydantic>=2.10,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-cov>=6.0,<7.0",
+    "ruff>=0.9,<1.0",
+]
+
+[project.scripts]
+retail-guardian = "retail_guardian.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/retail_guardian"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
