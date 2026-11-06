@@ -12,7 +12,12 @@ import numpy as np
 import pandas as pd
 
 from retail_guardian.config import PipelineConfig
-from retail_guardian.investigation_models import Evidence, InvestigationReport
+from retail_guardian.investigation_models import (
+    Evidence,
+    InvestigationReport,
+    ModelDecision,
+    RejectedDecisionDiagnostic,
+)
 from retail_guardian.models import CheckResult, _json_ready
 from retail_guardian.pipeline import PipelineRun
 
@@ -56,6 +61,22 @@ class HistoryRepository(Protocol):
         evidence: Evidence,
         started_at: datetime,
         completed_at: datetime,
+    ) -> None: ...
+
+    def record_model_decision(
+        self,
+        investigation_id: str,
+        sequence: int,
+        decision: ModelDecision,
+        created_at: datetime,
+    ) -> None: ...
+
+    def record_model_rejection(
+        self,
+        investigation_id: str,
+        sequence: int,
+        rejection: RejectedDecisionDiagnostic,
+        created_at: datetime,
     ) -> None: ...
 
     def complete_investigation(self, report: InvestigationReport) -> None: ...
@@ -148,6 +169,27 @@ class SQLiteHistoryRepository:
                     error TEXT,
                     started_at TEXT NOT NULL,
                     completed_at TEXT NOT NULL,
+                    PRIMARY KEY (investigation_id, sequence)
+                );
+                CREATE TABLE IF NOT EXISTS agent_decision (
+                    investigation_id TEXT NOT NULL
+                        REFERENCES investigation_session(investigation_id),
+                    sequence INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (investigation_id, sequence)
+                );
+                CREATE TABLE IF NOT EXISTS model_rejection (
+                    investigation_id TEXT NOT NULL
+                        REFERENCES investigation_session(investigation_id),
+                    sequence INTEGER NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    error_type TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    decision_json TEXT,
+                    content_length INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
                     PRIMARY KEY (investigation_id, sequence)
                 );
                 CREATE TABLE IF NOT EXISTS evidence (
@@ -411,6 +453,52 @@ class SQLiteHistoryRepository:
                 ),
             )
 
+    def record_model_decision(
+        self,
+        investigation_id: str,
+        sequence: int,
+        decision: ModelDecision,
+        created_at: datetime,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO agent_decision
+                   (investigation_id, sequence, action, decision_json, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    investigation_id,
+                    sequence,
+                    decision.action,
+                    _dump(decision),
+                    created_at.isoformat(),
+                ),
+            )
+
+    def record_model_rejection(
+        self,
+        investigation_id: str,
+        sequence: int,
+        rejection: RejectedDecisionDiagnostic,
+        created_at: datetime,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO model_rejection
+                   (investigation_id, sequence, attempt, error_type, error,
+                    decision_json, content_length, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    investigation_id,
+                    sequence,
+                    rejection.attempt,
+                    rejection.error_type,
+                    rejection.error,
+                    None if rejection.decision is None else _dump(rejection.decision),
+                    rejection.content_length,
+                    created_at.isoformat(),
+                ),
+            )
+
     def complete_investigation(self, report: InvestigationReport) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -442,6 +530,96 @@ class SQLiteHistoryRepository:
             }
             for row in rows
         ]
+
+    def get_investigation_trace(self, investigation_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            session = connection.execute(
+                "SELECT * FROM investigation_session WHERE investigation_id = ?",
+                (investigation_id,),
+            ).fetchone()
+            if session is None:
+                return None
+            decisions = connection.execute(
+                """SELECT sequence, action, decision_json, created_at
+                   FROM agent_decision WHERE investigation_id = ? ORDER BY sequence""",
+                (investigation_id,),
+            ).fetchall()
+            tool_calls = connection.execute(
+                """SELECT sequence, tool_name, arguments_json, rationale, success, error,
+                          started_at, completed_at
+                   FROM agent_tool_call WHERE investigation_id = ? ORDER BY sequence""",
+                (investigation_id,),
+            ).fetchall()
+            evidence = connection.execute(
+                """SELECT evidence_id, tool_sequence, tool_name, summary, data_json,
+                          success, error
+                   FROM evidence WHERE investigation_id = ? ORDER BY tool_sequence""",
+                (investigation_id,),
+            ).fetchall()
+            rejections = connection.execute(
+                """SELECT sequence, attempt, error_type, error, decision_json,
+                          content_length, created_at
+                   FROM model_rejection WHERE investigation_id = ? ORDER BY sequence""",
+                (investigation_id,),
+            ).fetchall()
+        return {
+            "investigation_id": investigation_id,
+            "incident_id": session["incident_id"],
+            "status": session["status"],
+            "started_at": session["started_at"],
+            "completed_at": session["completed_at"],
+            "decisions": [
+                {
+                    "sequence": row["sequence"],
+                    "action": row["action"],
+                    "created_at": row["created_at"],
+                    "decision": json.loads(row["decision_json"]),
+                }
+                for row in decisions
+            ],
+            "tool_calls": [
+                {
+                    "sequence": row["sequence"],
+                    "tool_name": row["tool_name"],
+                    "arguments": json.loads(row["arguments_json"]),
+                    "rationale": row["rationale"],
+                    "success": bool(row["success"]),
+                    "error": row["error"],
+                    "started_at": row["started_at"],
+                    "completed_at": row["completed_at"],
+                }
+                for row in tool_calls
+            ],
+            "evidence": [
+                {
+                    "evidence_id": row["evidence_id"],
+                    "tool_sequence": row["tool_sequence"],
+                    "tool_name": row["tool_name"],
+                    "summary": row["summary"],
+                    "data": json.loads(row["data_json"]),
+                    "success": bool(row["success"]),
+                    "error": row["error"],
+                }
+                for row in evidence
+            ],
+            "rejected_model_decisions": [
+                {
+                    "sequence": row["sequence"],
+                    "attempt": row["attempt"],
+                    "error_type": row["error_type"],
+                    "error": row["error"],
+                    "decision": (
+                        json.loads(row["decision_json"])
+                        if row["decision_json"] is not None
+                        else None
+                    ),
+                    "content_length": row["content_length"],
+                    "created_at": row["created_at"],
+                }
+                for row in rejections
+            ],
+            "report": json.loads(session["report_json"]) if session["report_json"] else None,
+        }
 
 
 def _validation_row(execution_id: str, result: CheckResult) -> tuple[Any, ...]:

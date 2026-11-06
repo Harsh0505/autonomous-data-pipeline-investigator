@@ -9,7 +9,11 @@ from pathlib import Path
 
 from retail_guardian.evaluation import BenchmarkEvaluator
 from retail_guardian.investigation import InvestigationAgent
-from retail_guardian.providers import HeuristicInvestigationModel, OpenAIInvestigationModel
+from retail_guardian.providers import (
+    HeuristicInvestigationModel,
+    OllamaInvestigationModel,
+    OpenAIInvestigationModel,
+)
 from retail_guardian.scenarios import SCENARIOS, run_scenario
 from retail_guardian.storage import SQLiteHistoryRepository
 
@@ -38,19 +42,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     investigate_parser.add_argument("--incident-id", required=True)
     investigate_parser.add_argument("--database", type=Path, default=Path("artifacts/history.db"))
-    investigate_parser.add_argument("--provider", choices=("mock", "openai"), default="mock")
+    investigate_parser.add_argument(
+        "--provider", choices=("mock", "ollama", "openai"), default="ollama"
+    )
     investigate_parser.add_argument("--model", default=None)
+    investigate_parser.add_argument("--endpoint", default=None)
+    investigate_parser.add_argument("--timeout", type=float, default=120.0)
+    investigate_parser.add_argument("--model-retries", type=int, default=2)
     investigate_parser.add_argument("--max-tool-calls", type=int, default=8)
     investigate_parser.add_argument("--output", type=Path, default=None)
     benchmark_parser = subparsers.add_parser(
         "benchmark", help="Evaluate investigations against hidden synthetic ground truth"
     )
     benchmark_parser.add_argument("--database", type=Path, default=Path("artifacts/benchmark.db"))
-    benchmark_parser.add_argument("--provider", choices=("mock", "openai"), default="mock")
+    benchmark_parser.add_argument(
+        "--provider", choices=("mock", "ollama", "openai"), default="ollama"
+    )
     benchmark_parser.add_argument("--model", default=None)
+    benchmark_parser.add_argument("--endpoint", default=None)
+    benchmark_parser.add_argument("--timeout", type=float, default=120.0)
+    benchmark_parser.add_argument("--model-retries", type=int, default=2)
     benchmark_parser.add_argument("--rows", type=int, default=500)
     benchmark_parser.add_argument("--seed", type=int, default=42)
     benchmark_parser.add_argument("--max-tool-calls", type=int, default=8)
+    benchmark_parser.add_argument("--output", type=Path, default=None)
+    trace_parser = subparsers.add_parser(
+        "trace", help="Print a persisted investigation decision and tool trace"
+    )
+    trace_parser.add_argument("--investigation-id", required=True)
+    trace_parser.add_argument("--database", type=Path, default=Path("artifacts/history.db"))
     return parser
 
 
@@ -63,6 +83,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_investigation(args)
     if args.command == "benchmark":
         return _run_benchmark(args)
+    if args.command == "trace":
+        return _show_trace(args)
 
     as_of = args.as_of or datetime.now(UTC)
     output_dir: Path = args.output_dir
@@ -94,7 +116,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run_investigation(args: argparse.Namespace) -> int:
     try:
         repository = SQLiteHistoryRepository(args.database)
-        model = _build_model(args.provider, args.model)
+        model = _build_model(
+            args.provider,
+            args.model,
+            endpoint=args.endpoint,
+            timeout=args.timeout,
+            model_retries=args.model_retries,
+        )
         report = InvestigationAgent(
             repository, model, max_tool_calls=args.max_tool_calls
         ).investigate(args.incident_id)
@@ -114,7 +142,13 @@ def _run_benchmark(args: argparse.Namespace) -> int:
         def agent_factory() -> InvestigationAgent:
             return InvestigationAgent(
                 repository,
-                _build_model(args.provider, args.model),
+                _build_model(
+                    args.provider,
+                    args.model,
+                    endpoint=args.endpoint,
+                    timeout=args.timeout,
+                    model_retries=args.model_retries,
+                ),
                 max_tool_calls=args.max_tool_calls,
             )
 
@@ -125,13 +159,41 @@ def _run_benchmark(args: argparse.Namespace) -> int:
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
+    output = json.dumps(summary.to_dict(), indent=2, sort_keys=True)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(output + "\n", encoding="utf-8")
+    print(output)
+    return 1 if summary.investigation_failures or summary.timeouts else 0
+
+
+def _show_trace(args: argparse.Namespace) -> int:
+    repository = SQLiteHistoryRepository(args.database)
+    trace = repository.get_investigation_trace(args.investigation_id)
+    if trace is None:
+        print(f"error: investigation not found: {args.investigation_id}", file=sys.stderr)
+        return 2
+    print(json.dumps(trace, indent=2, sort_keys=True))
     return 0
 
 
-def _build_model(provider: str, model_name: str | None):
+def _build_model(
+    provider: str,
+    model_name: str | None,
+    *,
+    endpoint: str | None = None,
+    timeout: float = 120.0,
+    model_retries: int = 2,
+):
     if provider == "openai":
         return OpenAIInvestigationModel(model_name)
+    if provider == "ollama":
+        return OllamaInvestigationModel(
+            model_name,
+            endpoint=endpoint,
+            timeout_seconds=timeout,
+            max_retries=model_retries,
+        )
     return HeuristicInvestigationModel()
 
 

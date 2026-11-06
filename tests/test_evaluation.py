@@ -22,3 +22,11 @@ def test_benchmark_evaluates_all_hidden_failure_labels(tmp_path, as_of) -> None:
     assert summary.average_tool_calls == 2.0
     assert summary.total_tokens is None
     assert summary.baseline_accuracy == 1.0
+    assert summary.evaluation_type == "deterministic_mock"
+    assert summary.provider_name == "mock"
+    assert summary.model_name == "heuristic"
+    assert summary.average_duration_seconds >= 0
+    assert summary.invalid_tool_calls == 0
+    assert summary.model_validation_failures == 0
+    assert summary.investigation_failures == 0
+    assert summary.timeouts == 0

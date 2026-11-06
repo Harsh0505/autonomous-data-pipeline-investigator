@@ -66,7 +66,15 @@ class InvestigationReport:
     conclusion: InvestigationConclusion
     tool_call_count: int
     token_usage: int | None = None
-    schema_version: str = "1.0"
+    duration_seconds: float = 0.0
+    decision_count: int = 0
+    invalid_tool_calls: int = 0
+    model_validation_failures: int = 0
+    investigation_failures: int = 0
+    timeouts: int = 0
+    provider_name: str = "unknown"
+    model_name: str = "unknown"
+    schema_version: str = "2.0"
 
     def to_dict(self) -> dict[str, Any]:
         return _json_ready(asdict(self))
@@ -100,6 +108,29 @@ class ModelDecision:
     tool_request: ToolRequest | None = None
     conclusion: InvestigationConclusion | None = None
     token_usage: int | None = None
+
+
+@dataclass(frozen=True)
+class RejectedDecisionDiagnostic:
+    attempt: int
+    error_type: str
+    error: str
+    decision: dict[str, Any] | None
+    content_length: int
+
+
+@dataclass
+class ProviderTelemetry:
+    provider_name: str
+    model_name: str
+    calls: int = 0
+    validation_failures: int = 0
+    invalid_tool_calls: int = 0
+    connection_failures: int = 0
+    timeouts: int = 0
+    retries: int = 0
+    duration_seconds: float = 0.0
+    rejected_decisions: list[RejectedDecisionDiagnostic] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

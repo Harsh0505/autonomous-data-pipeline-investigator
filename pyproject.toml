@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "retail-pipeline-guardian"
-version = "0.2.0"
+version = "0.2.6"
 description = "Autonomous retail data-pipeline incident detection and investigation"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,7 @@ dependencies = [
     "langgraph>=1.0,<2.0",
     "openai>=2.0,<3.0",
     "pydantic>=2.10,<3.0",
+    "httpx>=0.28,<1.0",
 ]
 
 [project.optional-dependencies]

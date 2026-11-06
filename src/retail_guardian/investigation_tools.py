@@ -88,17 +88,19 @@ class InvestigationToolbox:
 
     def execute(self, name: str, arguments: dict[str, Any] | None = None) -> Evidence:
         evidence_id = f"EV-{uuid4().hex[:12].upper()}"
-        if name not in self._tools:
+        arguments = arguments or {}
+        validation_error = self.validate_request(name, arguments)
+        if validation_error:
             return Evidence(
                 evidence_id=evidence_id,
                 tool_name=name,
-                summary="Investigation tool call failed",
+                summary="Investigation tool request was rejected",
                 data={},
                 success=False,
-                error=f"unknown investigation tool: {name}",
+                error=validation_error,
             )
         try:
-            summary, data = self._tools[name](arguments or {})
+            summary, data = self._tools[name](arguments)
         except Exception as exc:  # Storage and decoding failures must become observable evidence.
             return Evidence(
                 evidence_id=evidence_id,
@@ -109,6 +111,27 @@ class InvestigationToolbox:
                 error=str(exc),
             )
         return Evidence(evidence_id, name, summary, data)
+
+    def validate_request(self, name: str, arguments: dict[str, Any]) -> str | None:
+        definitions = {item.name: item for item in self.definitions}
+        definition = definitions.get(name)
+        if definition is None:
+            return f"unknown investigation tool (unauthorised): {name}"
+        unexpected = set(arguments) - set(definition.parameters)
+        if unexpected:
+            return f"unsupported arguments for {name}: {sorted(unexpected)}"
+        for argument_name, value in arguments.items():
+            specification = definition.parameters[argument_name]
+            if specification.get("type") == "integer":
+                if isinstance(value, bool) or not isinstance(value, int):
+                    return f"{argument_name} must be an integer"
+                if value < specification.get("minimum", value):
+                    return f"{argument_name} is below the allowed minimum"
+                if value > specification.get("maximum", value):
+                    return f"{argument_name} exceeds the allowed maximum"
+            if specification.get("type") == "string" and not isinstance(value, str):
+                return f"{argument_name} must be a string"
+        return None
 
     def _inspect_dataset(self, _: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         profile = self.repository.get_profile(self.execution_id)

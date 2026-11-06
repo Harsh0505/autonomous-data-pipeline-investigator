@@ -23,6 +23,14 @@ class EvaluationCase:
     completed: bool
     baseline_prediction: str | None
     baseline_correct: bool
+    status: str
+    duration_seconds: float
+    invalid_tool_calls: int
+    model_validation_failures: int
+    investigation_failures: int
+    timeouts: int
+    provider_name: str
+    model_name: str
 
 
 @dataclass(frozen=True)
@@ -34,6 +42,14 @@ class EvaluationSummary:
     average_tool_calls: float
     total_tokens: int | None
     baseline_accuracy: float
+    average_duration_seconds: float
+    invalid_tool_calls: int
+    model_validation_failures: int
+    investigation_failures: int
+    timeouts: int
+    evaluation_type: str
+    provider_name: str
+    model_name: str
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -110,6 +126,14 @@ class BenchmarkEvaluator:
             completed=report.status in {"completed", "inconclusive"},
             baseline_prediction=baseline,
             baseline_correct=baseline == expected,
+            status=report.status,
+            duration_seconds=report.duration_seconds,
+            invalid_tool_calls=report.invalid_tool_calls,
+            model_validation_failures=report.model_validation_failures,
+            investigation_failures=report.investigation_failures,
+            timeouts=report.timeouts,
+            provider_name=report.provider_name,
+            model_name=report.model_name,
         )
 
 
@@ -136,6 +160,15 @@ def validation_baseline(run: PipelineRun) -> str | None:
 def _summarize(cases: list[EvaluationCase]) -> EvaluationSummary:
     count = len(cases)
     tokens = [case.token_usage for case in cases if case.token_usage is not None]
+    provider_names = {case.provider_name for case in cases}
+    model_names = {case.model_name for case in cases}
+    provider_name = next(iter(provider_names)) if len(provider_names) == 1 else "mixed"
+    model_name = next(iter(model_names)) if len(model_names) == 1 else "mixed"
+    evaluation_type = {
+        "mock": "deterministic_mock",
+        "ollama": "real_local_llm",
+        "openai": "external_llm",
+    }.get(provider_name, "unknown")
     return EvaluationSummary(
         cases=cases,
         accuracy=sum(case.correct for case in cases) / count,
@@ -144,4 +177,12 @@ def _summarize(cases: list[EvaluationCase]) -> EvaluationSummary:
         average_tool_calls=sum(case.tool_calls for case in cases) / count,
         total_tokens=sum(tokens) if tokens else None,
         baseline_accuracy=sum(case.baseline_correct for case in cases) / count,
+        average_duration_seconds=sum(case.duration_seconds for case in cases) / count,
+        invalid_tool_calls=sum(case.invalid_tool_calls for case in cases),
+        model_validation_failures=sum(case.model_validation_failures for case in cases),
+        investigation_failures=sum(case.investigation_failures for case in cases),
+        timeouts=sum(case.timeouts for case in cases),
+        evaluation_type=evaluation_type,
+        provider_name=provider_name,
+        model_name=model_name,
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
@@ -28,7 +29,12 @@ class _InvestigationState(TypedDict):
     evidence: list[Evidence]
     tools_used: list[str]
     tool_call_count: int
+    decision_count: int
+    invalid_tool_calls: int
+    tool_request_signatures: list[str]
+    persisted_rejection_count: int
     token_usage: int
+    fatal_model_error: bool
     pending_decision: ModelDecision | None
     report: InvestigationReport | None
 
@@ -67,7 +73,12 @@ class InvestigationAgent:
             "evidence": [],
             "tools_used": [],
             "tool_call_count": 0,
+            "decision_count": 0,
+            "invalid_tool_calls": 0,
+            "tool_request_signatures": [],
+            "persisted_rejection_count": 0,
             "token_usage": 0,
+            "fatal_model_error": False,
             "pending_decision": None,
             "report": None,
         }
@@ -107,7 +118,9 @@ class InvestigationAgent:
         )
         try:
             decision = self.model.decide(context)
+            fatal_model_error = False
         except Exception as exc:  # Provider errors become an explicit inconclusive result.
+            fatal_model_error = True
             decision = ModelDecision(
                 action="conclude",
                 hypotheses=state["hypotheses"],
@@ -124,10 +137,26 @@ class InvestigationAgent:
                 ),
                 token_usage=decision.token_usage,
             )
+        telemetry = getattr(self.model, "telemetry", None)
+        rejections = getattr(telemetry, "rejected_decisions", [])
+        for sequence, rejection in enumerate(
+            rejections[state["persisted_rejection_count"] :],
+            start=state["persisted_rejection_count"] + 1,
+        ):
+            self.repository.record_model_rejection(
+                state["investigation_id"], sequence, rejection, datetime.now(UTC)
+            )
+        decision_sequence = state["decision_count"] + 1
+        self.repository.record_model_decision(
+            state["investigation_id"], decision_sequence, decision, datetime.now(UTC)
+        )
         return {
             "hypotheses": _sanitize_hypotheses(decision.hypotheses, state["evidence"]),
             "pending_decision": decision,
             "token_usage": state["token_usage"] + (decision.token_usage or 0),
+            "decision_count": decision_sequence,
+            "fatal_model_error": state["fatal_model_error"] or fatal_model_error,
+            "persisted_rejection_count": len(rejections),
         }
 
     def _route_decision(self, state: _InvestigationState) -> Literal["tool", "finalize"]:
@@ -139,8 +168,23 @@ class InvestigationAgent:
         if decision is None or decision.tool_request is None:
             raise RuntimeError("tool node received no tool request")
         request = decision.tool_request
+        signature = json.dumps(
+            {"name": request.name, "arguments": request.arguments}, sort_keys=True
+        )
+        validation_error = self._require_toolbox().validate_request(request.name, request.arguments)
+        is_duplicate = signature in state["tool_request_signatures"]
         started_at = datetime.now(UTC)
-        evidence = self._require_toolbox().execute(request.name, request.arguments)
+        if is_duplicate:
+            evidence = Evidence(
+                evidence_id=f"EV-{uuid4().hex[:12].upper()}",
+                tool_name=request.name,
+                summary="Duplicate investigation tool request was rejected",
+                data={},
+                success=False,
+                error="duplicate tool request",
+            )
+        else:
+            evidence = self._require_toolbox().execute(request.name, request.arguments)
         completed_at = datetime.now(UTC)
         sequence = state["tool_call_count"] + 1
         self.repository.record_tool_call(
@@ -157,6 +201,9 @@ class InvestigationAgent:
             "evidence": [*state["evidence"], evidence],
             "tools_used": [*state["tools_used"], request.name],
             "tool_call_count": sequence,
+            "invalid_tool_calls": state["invalid_tool_calls"]
+            + int(validation_error is not None or is_duplicate),
+            "tool_request_signatures": [*state["tool_request_signatures"], signature],
             "pending_decision": None,
         }
 
@@ -168,21 +215,34 @@ class InvestigationAgent:
                 state["evidence"], "The model did not provide a conclusion"
             )
         conclusion = _sanitize_conclusion(conclusion, state["evidence"])
-        status = (
-            "inconclusive" if conclusion.confidence == ConfidenceLevel.INSUFFICIENT else "completed"
-        )
+        status = "completed"
+        if state["fatal_model_error"]:
+            status = "failed"
+        elif conclusion.confidence == ConfidenceLevel.INSUFFICIENT:
+            status = "inconclusive"
+        completed_at = datetime.now(UTC)
+        telemetry = getattr(self.model, "telemetry", None)
         report = InvestigationReport(
             investigation_id=state["investigation_id"],
             incident_id=str(state["incident"]["incident_id"]),
             status=status,
             started_at=state["started_at"],
-            completed_at=datetime.now(UTC),
+            completed_at=completed_at,
             hypotheses=state["hypotheses"],
             evidence=state["evidence"],
             tools_used=state["tools_used"],
             conclusion=conclusion,
             tool_call_count=state["tool_call_count"],
             token_usage=state["token_usage"] or None,
+            duration_seconds=round((completed_at - state["started_at"]).total_seconds(), 6),
+            decision_count=state["decision_count"],
+            invalid_tool_calls=state["invalid_tool_calls"]
+            + getattr(telemetry, "invalid_tool_calls", 0),
+            model_validation_failures=getattr(telemetry, "validation_failures", 0),
+            investigation_failures=int(state["fatal_model_error"]),
+            timeouts=getattr(telemetry, "timeouts", 0),
+            provider_name=getattr(telemetry, "provider_name", "unknown"),
+            model_name=getattr(telemetry, "model_name", "unknown"),
         )
         self.repository.complete_investigation(report)
         return {"report": report}
