@@ -9,6 +9,12 @@ from typing import Any, Literal, Protocol
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from retail_guardian.causal_evidence import (
+    CausalEvidenceError,
+    assess_causal_evidence,
+    require_causal_evidence_alignment,
+    require_causal_support,
+)
 from retail_guardian.hypothesis_state import (
     HypothesisTransitionError,
     apply_hypothesis_operations,
@@ -43,7 +49,61 @@ DiagnosisCode = Literal[
     "unexpected_categories",
     "delayed_data",
     "statistical_price_anomaly",
+    "supplier_batch_replay",
+    "failed_job_retry",
+    "incorrect_join_cardinality",
+    "source_system_omission",
+    "transformation_logic_error",
+    "supplier_data_error",
+    "legitimate_taxonomy_update",
+    "late_supplier_delivery",
+    "scheduler_backlog",
 ]
+
+_DIAGNOSIS_TAXONOMY = {
+    "schema_change": "Observed dataset columns or types changed from the expected schema.",
+    "duplicate_records": "Order identifiers or records are duplicated.",
+    "currency_mismatch": "Observed supplier currencies conflict with configured currencies.",
+    "missing_values": "Required sale fields contain missing values.",
+    "unexpected_categories": "Observed categories are outside the configured taxonomy.",
+    "delayed_data": "Data delivery exceeded its freshness contract.",
+    "statistical_price_anomaly": "Prices depart materially from statistical baselines.",
+    "supplier_batch_replay": (
+        "The supplier submitted the same batch payload more than once and both were accepted."
+    ),
+    "failed_job_retry": (
+        "A job retried after a partial durable write and repeated non-idempotent output."
+    ),
+    "incorrect_join_cardinality": (
+        "A transformation join multiplied rows because actual key cardinality violated its design."
+    ),
+    "source_system_omission": (
+        "Required values were already absent in the submitted source payload."
+    ),
+    "transformation_logic_error": (
+        "Source values were present but transformation logic lost or corrupted them."
+    ),
+    "supplier_data_error": (
+        "Supplier data violated the currently applicable contract without an approved change."
+    ),
+    "legitimate_taxonomy_update": (
+        "An approved taxonomy change was valid upstream but the pipeline used a stale version."
+    ),
+    "late_supplier_delivery": (
+        "The supplier delivered the batch after its agreed delivery window."
+    ),
+    "scheduler_backlog": (
+        "The batch arrived on time but waited excessively in orchestration before processing."
+    ),
+}
+
+_CAUSAL_EVIDENCE_TOOLS = {
+    "get_pipeline_logs",
+    "get_supplier_submissions",
+    "get_orchestration_events",
+    "get_transformation_metadata",
+    "get_configuration_changes",
+}
 
 
 class ProviderError(RuntimeError):
@@ -63,6 +123,10 @@ class ProviderTimeoutError(ProviderError):
 
 
 class ModelOutputValidationError(ProviderError):
+    pass
+
+
+class CausalClaimValidationError(ModelOutputValidationError):
     pass
 
 
@@ -107,6 +171,19 @@ class HeuristicInvestigationModel:
     def decide(self, context: InvestigationContext) -> ModelDecision:
         self.telemetry.calls += 1
         self.telemetry.first_attempt_schema_valid_decisions += 1
+        if context.investigation_objective == "identify_underlying_root_cause":
+            return ModelDecision(
+                action="conclude",
+                hypotheses=[],
+                conclusion=InvestigationConclusion(
+                    None,
+                    "The deterministic mock does not infer upstream causal mechanisms",
+                    ConfidenceLevel.INSUFFICIENT,
+                    [],
+                    ["Which operational facts distinguish the competing causes?"],
+                    ["Use a reasoning-capable provider for the root-cause benchmark"],
+                ),
+            )
         validation_evidence = next(
             (item for item in context.evidence if item.tool_name == "get_validation_failures"),
             None,
@@ -246,6 +323,9 @@ class OpenAIInvestigationModel:
         self.telemetry.first_attempt_schema_valid_decisions += 1
         usage = getattr(response, "usage", None)
         token_usage = getattr(usage, "total_tokens", None) if usage else None
+        if isinstance(token_usage, int) and not isinstance(token_usage, bool):
+            self.telemetry.token_usage += token_usage
+            self.telemetry.token_usage_available = True
         decision = payload.to_domain(token_usage)
         try:
             _validate_decision_for_context(decision, context)
@@ -288,15 +368,22 @@ class OllamaInvestigationModel:
 
     def decide(self, context: InvestigationContext) -> ModelDecision:
         token_usage = 0
+        token_usage_available = False
         last_error: ProviderError | None = None
         correction: str | None = None
+        require_tool = False
         for attempt in range(self.max_retries + 1):
             content: str | None = None
             if attempt:
                 self.telemetry.retries += 1
             try:
-                response_payload = self._request(context, correction)
-                token_usage += _ollama_token_usage(response_payload)
+                response_payload = self._request(context, correction, require_tool=require_tool)
+                attempt_usage = _ollama_token_usage(response_payload)
+                if attempt_usage is not None:
+                    token_usage += attempt_usage
+                    token_usage_available = True
+                    self.telemetry.token_usage += attempt_usage
+                    self.telemetry.token_usage_available = True
                 content = response_payload.get("message", {}).get("content")
                 if not isinstance(content, str) or not content.strip():
                     raise ModelOutputValidationError(
@@ -305,8 +392,12 @@ class OllamaInvestigationModel:
                 payload = _DecisionPayload.model_validate_json(content)
                 if attempt == 0:
                     self.telemetry.first_attempt_schema_valid_decisions += 1
-                decision = payload.to_domain(token_usage or None)
-                _validate_decision_for_context(decision, context)
+                decision = payload.to_domain(token_usage if token_usage_available else None)
+                _validate_decision_for_context(
+                    decision,
+                    context,
+                    require_tool_recovery=require_tool,
+                )
                 if attempt > 0:
                     self.telemetry.retry_recoveries += 1
                 return decision
@@ -336,16 +427,27 @@ class OllamaInvestigationModel:
                 self.telemetry.rejected_decisions.append(
                     _rejection_diagnostic(attempt + 1, last_error, content)
                 )
-                correction = _correction_feedback(last_error, context)
+                require_tool = require_tool or isinstance(last_error, CausalClaimValidationError)
+                correction = _correction_feedback(
+                    last_error,
+                    context,
+                    require_tool_recovery=require_tool,
+                )
             if attempt == self.max_retries:
                 break
         assert last_error is not None
         raise last_error
 
-    def _request(self, context: InvestigationContext, correction: str | None) -> dict[str, Any]:
+    def _request(
+        self,
+        context: InvestigationContext,
+        correction: str | None,
+        *,
+        require_tool: bool = False,
+    ) -> dict[str, Any]:
         self.telemetry.calls += 1
         started_at = perf_counter()
-        decision_schema = _decision_schema(context)
+        decision_schema = _decision_schema(context, require_tool=require_tool)
         messages = [
             {
                 "role": "system",
@@ -453,42 +555,44 @@ class _HypothesisOperationPayload(BaseModel):
         )
 
 
-class _NoArgumentToolRequestPayload(BaseModel):
+class _ToolRequestPayloadBase(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    rationale: str = Field(min_length=1, max_length=240)
+    question_id: str = Field(min_length=1, max_length=40)
+    question: str = Field(min_length=1, max_length=240)
+    hypothesis_ids: list[str]
+
+
+class _NoArgumentToolRequestPayload(_ToolRequestPayloadBase):
     name: Literal[
         "inspect_dataset",
         "get_validation_failures",
         "compare_schemas",
         "compare_distributions",
         "get_data_contract",
+        "get_pipeline_logs",
+        "get_supplier_submissions",
+        "get_orchestration_events",
+        "get_transformation_metadata",
+        "get_configuration_changes",
     ]
-    rationale: str
 
 
-class _SampleRecordsToolRequestPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
+class _SampleRecordsToolRequestPayload(_ToolRequestPayloadBase):
     name: Literal["sample_problematic_records"]
     check_id: str | None
     limit: int | None
-    rationale: str
 
 
-class _PipelineHistoryToolRequestPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
+class _PipelineHistoryToolRequestPayload(_ToolRequestPayloadBase):
     name: Literal["get_pipeline_history"]
     limit: int | None
-    rationale: str
 
 
-class _AffectedDimensionsToolRequestPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
+class _AffectedDimensionsToolRequestPayload(_ToolRequestPayloadBase):
     name: Literal["identify_affected_dimensions"]
     check_id: str | None
-    rationale: str
 
 
 _ToolRequestPayload = (
@@ -547,11 +651,17 @@ class _DecisionPayload(BaseModel):
             payload = self.tool_request.model_dump()
             name = payload.pop("name")
             rationale = payload.pop("rationale")
+            question_id = payload.pop("question_id")
+            question = payload.pop("question")
+            hypothesis_ids = payload.pop("hypothesis_ids")
             arguments = {key: value for key, value in payload.items() if value is not None}
             tool_request = ToolRequest(
                 name,
                 arguments,
                 rationale,
+                question_id,
+                question,
+                hypothesis_ids,
             )
         return ModelDecision(
             action=self.action,
@@ -576,6 +686,7 @@ def _context_payload(context: InvestigationContext) -> dict[str, object]:
     }
     return {
         "observable_incident": _compact_incident(context.incident),
+        "investigation_objective": context.investigation_objective,
         "current_hypotheses": [
             {
                 "hypothesis_id": item.hypothesis_id,
@@ -589,13 +700,80 @@ def _context_payload(context: InvestigationContext) -> dict[str, object]:
         ],
         "evidence_registry": evidence_registry,
         "available_evidence_ids": [item.evidence_id for item in context.evidence],
-        "supportable_evidence_ids": [
+        "citable_evidence_ids": [
             item.evidence_id
             for item in context.evidence
             if item.result_kind == ToolResultKind.INFORMATIVE
         ],
         "available_check_ids": context.available_check_ids,
-        "completed_tool_calls": [
+        "investigation_memory": _investigation_memory(context),
+        "tool_capabilities": {
+            item.name: {
+                "provides": item.description,
+                "answers": list(item.answers),
+                "limitations": item.limitations,
+                "arguments": item.parameters,
+            }
+            for item in context.available_tools
+        },
+        "remaining_tool_calls": context.remaining_tool_calls,
+        "remaining_invalid_tool_calls": context.remaining_invalid_tool_calls,
+        "remaining_empty_tool_calls": context.remaining_empty_tool_calls,
+        "remaining_duplicate_tool_calls": context.remaining_duplicate_tool_calls,
+        "decision_guidance": (
+            "For a tool action, state one compact unanswered causal question, then select the "
+            "capability that can answer it. Revise or reject hypotheses contradicted by memory. "
+            "Confirm and conclude as soon as facts are sufficient. Use only IDs allowed by the "
+            "schema and never repeat a used tool with equivalent arguments."
+        ),
+        "diagnosis_taxonomy": {
+            code: _DIAGNOSIS_TAXONOMY[code] for code in context.allowed_diagnosis_codes
+        },
+    }
+
+
+def _investigation_memory(context: InvestigationContext) -> dict[str, object]:
+    informative_ids = [
+        item.evidence_id
+        for item in context.evidence
+        if item.result_kind == ToolResultKind.INFORMATIVE
+    ]
+    hypothesis_checks = []
+    if context.investigation_objective == "identify_underlying_root_cause":
+        for hypothesis in context.hypotheses:
+            if hypothesis.diagnosis_code is None:
+                continue
+            assessment = assess_causal_evidence(
+                hypothesis.diagnosis_code,
+                informative_ids,
+                context.evidence,
+            )
+            hypothesis_checks.append(
+                {
+                    "hypothesis_id": hypothesis.hypothesis_id,
+                    "status": hypothesis.status.value,
+                    "factually_supported": assessment.supported,
+                    "supporting_evidence": list(assessment.supporting_evidence),
+                    "contradicting_evidence": list(assessment.contradicting_evidence),
+                    "relevant_nondiscriminating_evidence": list(assessment.relevant_evidence),
+                    "unavailable_evidence": list(assessment.unavailable_evidence),
+                    "information_needed": list(assessment.missing_requirements),
+                }
+            )
+    return {
+        "questions_investigated": [
+            {
+                "question_id": item.question_id,
+                "question": item.question,
+                "hypothesis_ids": item.hypothesis_ids,
+                "tool_name": item.tool_name,
+                "arguments": item.arguments,
+                "status": item.status.value,
+                "evidence_id": item.evidence_id,
+            }
+            for item in context.investigation_questions[-12:]
+        ],
+        "used_tool_calls": [
             {
                 "name": item.name,
                 "arguments": item.arguments,
@@ -603,38 +781,10 @@ def _context_payload(context: InvestigationContext) -> dict[str, object]:
                 "result_kind": item.result_kind.value,
                 "error": item.error,
             }
-            for item in context.completed_tool_calls
+            for item in context.completed_tool_calls[-12:]
         ],
-        "available_tools": [
-            {
-                "name": item.name,
-                "description": item.description,
-                "parameters": item.parameters,
-            }
-            for item in context.available_tools
-        ],
-        "remaining_tool_calls": context.remaining_tool_calls,
-        "remaining_invalid_tool_calls": context.remaining_invalid_tool_calls,
-        "remaining_empty_tool_calls": context.remaining_empty_tool_calls,
-        "decision_guidance": (
-            "Apply only the hypothesis operations needed for this turn. Confirm a supported "
-            "hypothesis and conclude as soon as evidence is sufficient; unused budget is not a "
-            "reason to continue. Otherwise select one currently available tool. Use only bare "
-            "evidence IDs and check IDs allowed by the schema."
-        ),
-        "diagnosis_taxonomy": {
-            "schema_change": "Observed dataset columns or types changed from the expected schema.",
-            "duplicate_records": "Order identifiers or records are duplicated.",
-            "currency_mismatch": (
-                "Observed supplier currencies conflict with configured supplier currencies."
-            ),
-            "missing_values": "Required sale fields contain missing values.",
-            "unexpected_categories": "Observed categories are outside the configured taxonomy.",
-            "delayed_data": "Data delivery exceeded its freshness or arrival-time contract.",
-            "statistical_price_anomaly": (
-                "Unit prices depart materially from established statistical baselines."
-            ),
-        },
+        "hypothesis_checks": hypothesis_checks,
+        "unexplored_tools": [item.name for item in context.available_tools],
     }
 
 
@@ -696,11 +846,24 @@ def _evidence_key_findings(evidence: Evidence) -> dict[str, Any]:
             "executions": data.get("executions", [])[:5],
             "sufficient_history": data.get("sufficient_history"),
         }
+    if evidence.tool_name in {
+        "get_pipeline_logs",
+        "get_supplier_submissions",
+        "get_orchestration_events",
+        "get_transformation_metadata",
+        "get_configuration_changes",
+    }:
+        records = data.get("records", [])
+        return {
+            "record_count": len(records),
+            "records": _compact_value(records[:8]),
+            "coverage": data.get("coverage", {}),
+        }
     return _compact_value(data)
 
 
 def _compact_value(value: Any, *, depth: int = 0) -> Any:
-    if depth >= 3:
+    if depth >= 6:
         return "[nested value omitted]"
     if isinstance(value, dict):
         return {
@@ -734,19 +897,31 @@ def _compact_incident(incident: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _decision_schema(context: InvestigationContext) -> dict[str, Any]:
+def _decision_schema(
+    context: InvestigationContext, *, require_tool: bool = False
+) -> dict[str, Any]:
     """Constrain Ollama to one valid action and currently executable tools."""
     schema = deepcopy(_DecisionPayload.model_json_schema())
-    supportable_ids = [
+    citable_ids = [
         item.evidence_id
         for item in context.evidence
         if item.result_kind == ToolResultKind.INFORMATIVE
     ]
+    causal_without_evidence = (
+        context.investigation_objective == "identify_underlying_root_cause" and not citable_ids
+    )
     operation_properties = schema["$defs"]["_HypothesisOperationPayload"]["properties"]
-    _restrict_array_values(operation_properties["supporting_evidence"], supportable_ids)
-    _restrict_array_values(operation_properties["contradicting_evidence"], supportable_ids)
+    _restrict_array_values(operation_properties["supporting_evidence"], citable_ids)
+    _restrict_array_values(operation_properties["contradicting_evidence"], citable_ids)
     conclusion_properties = schema["$defs"]["_ConclusionPayload"]["properties"]
-    _restrict_array_values(conclusion_properties["evidence_references"], supportable_ids)
+    _restrict_array_values(conclusion_properties["evidence_references"], citable_ids)
+    _restrict_optional_string(
+        operation_properties["diagnosis_code"], context.allowed_diagnosis_codes
+    )
+    conclusion_diagnosis_codes = [] if causal_without_evidence else context.allowed_diagnosis_codes
+    _restrict_optional_string(conclusion_properties["diagnosis_code"], conclusion_diagnosis_codes)
+    if causal_without_evidence:
+        conclusion_properties["confidence"]["enum"] = ["insufficient_evidence"]
     for definition_name in (
         "_SampleRecordsToolRequestPayload",
         "_AffectedDimensionsToolRequestPayload",
@@ -754,6 +929,17 @@ def _decision_schema(context: InvestigationContext) -> dict[str, Any]:
         _restrict_optional_string(
             schema["$defs"][definition_name]["properties"]["check_id"],
             context.available_check_ids,
+        )
+    hypothesis_ids = [item.hypothesis_id for item in context.hypotheses]
+    for definition_name in (
+        "_NoArgumentToolRequestPayload",
+        "_SampleRecordsToolRequestPayload",
+        "_PipelineHistoryToolRequestPayload",
+        "_AffectedDimensionsToolRequestPayload",
+    ):
+        _restrict_array_values(
+            schema["$defs"][definition_name]["properties"]["hypothesis_ids"],
+            hypothesis_ids,
         )
     allowed_tools = {item.name for item in context.available_tools}
     tool_property = schema["properties"]["tool_request"]
@@ -793,23 +979,33 @@ def _decision_schema(context: InvestigationContext) -> dict[str, Any]:
     available_tool_variants = [
         variant for variant in retained_variants if variant.get("type") != "null"
     ]
+    force_investigation_tool = require_tool and bool(available_tool_variants)
+    tool_operations_property = deepcopy(operations_property)
+    if force_investigation_tool:
+        tool_operations_property["maxItems"] = 0
     if available_tool_variants:
         action_variants.append(
             _action_schema(
                 "tool",
-                operations_property,
+                tool_operations_property,
                 {"anyOf": available_tool_variants},
                 {"type": "null"},
             )
         )
-    action_variants.append(
-        _action_schema(
-            "conclude",
-            operations_property,
-            {"type": "null"},
-            {"anyOf": conclusion_variants},
-        )
+    can_continue_causal_investigation = (
+        causal_without_evidence
+        and bool(available_tool_variants)
+        and context.remaining_tool_calls > 0
     )
+    if not can_continue_causal_investigation and not force_investigation_tool:
+        action_variants.append(
+            _action_schema(
+                "conclude",
+                operations_property,
+                {"type": "null"},
+                {"anyOf": conclusion_variants},
+            )
+        )
     for key in ("properties", "required", "additionalProperties"):
         schema.pop(key, None)
     schema["oneOf"] = action_variants
@@ -852,13 +1048,68 @@ def _restrict_optional_string(schema: dict[str, Any], values: list[str]) -> None
         schema["anyOf"] = [variant for variant in variants if variant.get("type") == "null"]
 
 
-def _validate_decision_for_context(decision: ModelDecision, context: InvestigationContext) -> None:
+def _validate_decision_for_context(
+    decision: ModelDecision,
+    context: InvestigationContext,
+    *,
+    require_tool_recovery: bool = False,
+) -> None:
+    if require_tool_recovery:
+        if decision.action != "tool" or decision.tool_request is None:
+            raise ModelOutputValidationError(
+                "causal recovery requires exactly one investigation tool request"
+            )
+        if decision.hypothesis_operations:
+            raise ModelOutputValidationError(
+                "causal recovery requires hypothesis_operations to be empty; rejected "
+                "hypothesis changes were not applied"
+            )
     evidence_ids = {item.evidence_id for item in context.evidence}
     supportable_evidence_ids = {
         item.evidence_id
         for item in context.evidence
         if item.result_kind == ToolResultKind.INFORMATIVE
     }
+    invalid_operation_codes = sorted(
+        {
+            operation.diagnosis_code
+            for operation in decision.hypothesis_operations
+            if operation.diagnosis_code is not None
+            and operation.diagnosis_code not in context.allowed_diagnosis_codes
+        }
+    )
+    if invalid_operation_codes:
+        raise ModelOutputValidationError(
+            "hypothesis operations used diagnosis codes that are not allowed for this objective: "
+            f"{invalid_operation_codes}. Allowed values: {context.allowed_diagnosis_codes}"
+        )
+    conclusion = decision.conclusion
+    if (
+        decision.action == "conclude"
+        and conclusion is not None
+        and conclusion.diagnosis_code is not None
+    ):
+        references = set(conclusion.evidence_references)
+        if not references.issubset(evidence_ids):
+            raise ModelOutputValidationError(
+                "conclusion referenced evidence that is not in the investigation state"
+            )
+        if not references:
+            raise ModelOutputValidationError("a diagnosis must cite at least one evidence ID")
+        if not references.issubset(supportable_evidence_ids):
+            failed_references = sorted(references - supportable_evidence_ids)
+            raise ModelOutputValidationError(
+                "a diagnosis may cite only informative evidence IDs; invalid references: "
+                f"{failed_references}"
+            )
+        try:
+            require_causal_support(
+                conclusion.diagnosis_code,
+                conclusion.evidence_references,
+                context.evidence,
+            )
+        except CausalEvidenceError as exc:
+            raise CausalClaimValidationError(str(exc)) from exc
     try:
         hypotheses = apply_hypothesis_operations(
             context.hypotheses,
@@ -867,10 +1118,62 @@ def _validate_decision_for_context(decision: ModelDecision, context: Investigati
         )
     except HypothesisTransitionError as exc:
         raise ModelOutputValidationError(f"invalid hypothesis operation: {exc}") from exc
+    hypotheses_by_id = {item.hypothesis_id: item for item in hypotheses}
+    try:
+        for operation in decision.hypothesis_operations:
+            hypothesis = hypotheses_by_id[operation.hypothesis_id]
+            if hypothesis.diagnosis_code is not None:
+                require_causal_evidence_alignment(
+                    hypothesis.diagnosis_code,
+                    hypothesis.supporting_evidence,
+                    hypothesis.contradicting_evidence,
+                    context.evidence,
+                    require_contradiction=(operation.operation == HypothesisOperationType.REJECT),
+                )
+    except CausalEvidenceError as exc:
+        raise CausalClaimValidationError(str(exc)) from exc
+    confirmed_ids = {
+        operation.hypothesis_id
+        for operation in decision.hypothesis_operations
+        if operation.operation == HypothesisOperationType.CONFIRM
+    }
+    try:
+        for hypothesis in hypotheses:
+            if hypothesis.hypothesis_id in confirmed_ids and hypothesis.diagnosis_code is not None:
+                require_causal_support(
+                    hypothesis.diagnosis_code,
+                    hypothesis.supporting_evidence,
+                    context.evidence,
+                )
+    except CausalEvidenceError as exc:
+        raise ModelOutputValidationError(str(exc)) from exc
 
     if decision.action == "tool":
         if decision.tool_request is None:
             raise ModelOutputValidationError("tool decision omitted tool_request")
+        question_ids = {item.question_id for item in context.investigation_questions}
+        if decision.tool_request.question_id in question_ids:
+            raise ModelOutputValidationError(
+                f"investigation question {decision.tool_request.question_id!r} was already used"
+            )
+        normalized_question = _normalize_question(decision.tool_request.question or "")
+        repeated_question = next(
+            (
+                item.question_id
+                for item in context.investigation_questions
+                if _normalize_question(item.question) == normalized_question
+            ),
+            None,
+        )
+        if repeated_question is not None:
+            raise ModelOutputValidationError(
+                f"the same causal question was already investigated as {repeated_question!r}"
+            )
+        unknown_hypotheses = set(decision.tool_request.hypothesis_ids) - set(hypotheses_by_id)
+        if unknown_hypotheses:
+            raise ModelOutputValidationError(
+                f"tool question referenced unknown hypothesis IDs: {sorted(unknown_hypotheses)}"
+            )
         definitions = {item.name: item for item in context.available_tools}
         definition = definitions.get(decision.tool_request.name)
         if definition is None:
@@ -895,17 +1198,12 @@ def _validate_decision_for_context(decision: ModelDecision, context: Investigati
     conclusion = decision.conclusion
     if conclusion is None:
         raise ModelOutputValidationError("conclude decision omitted conclusion")
-    allowed_diagnoses = {
-        "schema_change",
-        "duplicate_records",
-        "currency_mismatch",
-        "missing_values",
-        "unexpected_categories",
-        "delayed_data",
-        "statistical_price_anomaly",
-    }
+    allowed_diagnoses = set(context.allowed_diagnosis_codes)
     if conclusion.diagnosis_code is not None and conclusion.diagnosis_code not in allowed_diagnoses:
-        raise ModelOutputValidationError(f"unsupported diagnosis code: {conclusion.diagnosis_code}")
+        raise ModelOutputValidationError(
+            f"diagnosis code {conclusion.diagnosis_code!r} is not allowed for objective "
+            f"{context.investigation_objective!r}; allowed values: {sorted(allowed_diagnoses)}"
+        )
     references = set(conclusion.evidence_references)
     if not references.issubset(evidence_ids):
         raise ModelOutputValidationError(
@@ -928,6 +1226,18 @@ def _validate_decision_for_context(decision: ModelDecision, context: Investigati
             )
         except HypothesisTransitionError as exc:
             raise ModelOutputValidationError(f"unsupported conclusion: {exc}") from exc
+    elif (
+        context.investigation_objective == "identify_underlying_root_cause"
+        and context.remaining_tool_calls > 0
+    ):
+        unexplored = sorted(
+            item.name for item in context.available_tools if item.name in _CAUSAL_EVIDENCE_TOOLS
+        )
+        if unexplored:
+            raise ModelOutputValidationError(
+                "inconclusive conclusion is premature because operational evidence sources "
+                f"remain unexplored: {unexplored}"
+            )
 
 
 def _validate_tool_arguments(arguments: dict[str, Any], parameters: dict[str, Any]) -> None:
@@ -949,11 +1259,20 @@ def _validate_tool_arguments(arguments: dict[str, Any], parameters: dict[str, An
             )
 
 
-def _ollama_token_usage(payload: dict[str, Any]) -> int:
-    prompt_tokens = payload.get("prompt_eval_count", 0)
-    completion_tokens = payload.get("eval_count", 0)
-    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
-        return 0
+def _normalize_question(question: str) -> str:
+    return " ".join(question.casefold().split())
+
+
+def _ollama_token_usage(payload: dict[str, Any]) -> int | None:
+    prompt_tokens = payload.get("prompt_eval_count")
+    completion_tokens = payload.get("eval_count")
+    if (
+        not isinstance(prompt_tokens, int)
+        or isinstance(prompt_tokens, bool)
+        or not isinstance(completion_tokens, int)
+        or isinstance(completion_tokens, bool)
+    ):
+        return None
     return prompt_tokens + completion_tokens
 
 
@@ -981,7 +1300,12 @@ def _ollama_error(response: httpx.Response) -> str:
     return response.text.strip() or "unknown Ollama error"
 
 
-def _correction_feedback(error: ModelOutputValidationError, context: InvestigationContext) -> str:
+def _correction_feedback(
+    error: ModelOutputValidationError,
+    context: InvestigationContext,
+    *,
+    require_tool_recovery: bool = False,
+) -> str:
     evidence_ids = [item.evidence_id for item in context.evidence]
     available = ", ".join(evidence_ids) if evidence_ids else "none"
     tools = ", ".join(item.name for item in context.available_tools) or "none"
@@ -989,13 +1313,43 @@ def _correction_feedback(error: ModelOutputValidationError, context: Investigati
         ", ".join(item.name for item in context.completed_tool_calls if item.success) or "none"
     )
     check_ids = ", ".join(context.available_check_ids) or "none"
+    diagnoses = ", ".join(context.allowed_diagnosis_codes)
+    hypothesis_ids = ", ".join(item.hypothesis_id for item in context.hypotheses) or "none"
+    hypothesis_states = (
+        ", ".join(f"{item.hypothesis_id} ({item.status.value})" for item in context.hypotheses)
+        or "none"
+    )
+    if require_tool_recovery:
+        valid_actions = [
+            f"select exactly one available tool ({tools}) with hypothesis_operations set to []"
+        ]
+        recovery_guidance = (
+            "Causal recovery mode is active. Return a tool decision with "
+            "hypothesis_operations: []. Hypothesis state is frozen until the tool result is "
+            "available. Include a new question_id, one concise causal question, and the current "
+            "hypothesis IDs it distinguishes."
+        )
+    else:
+        valid_actions = [f"select one available tool ({tools})"]
+        if context.hypotheses:
+            valid_actions.append("update an existing hypothesis using its current ID")
+        if context.evidence:
+            valid_actions.append("confirm only when cited facts satisfy the causal requirement")
+            valid_actions.append("conclude insufficient_evidence if relevant evidence is exhausted")
+        recovery_guidance = ""
     return (
-        "The previous structured decision was rejected.\n"
+        "The previous structured decision was rejected and was not applied to investigation "
+        "state.\n"
         f"Specific validation failure: {str(error)[:1000]}\n"
+        f"Hypothesis IDs currently in state: {hypothesis_ids}.\n"
+        f"Current hypothesis states: {hypothesis_states}.\n"
         f"Available evidence IDs: {available}.\n"
         f"Currently available tools: {tools}.\n"
         f"Completed successful tools: {completed}.\n"
         f"Valid check_id values: {check_ids}.\n"
+        f"Diagnosis codes allowed for this objective: {diagnoses}.\n"
+        f"Valid actions remaining: {'; '.join(valid_actions)}.\n"
+        f"{recovery_guidance}\n"
         "Correct that specific error and return exactly one decision matching the JSON Schema. "
         "Evidence arrays accept bare IDs only, without summaries or annotations. Use create only "
         "for a new hypothesis ID and update, confirm, or reject for an existing ID. Confirm a "
@@ -1046,7 +1400,15 @@ def _safe_rejected_decision(content: str | None) -> dict[str, Any] | None:
     if isinstance(tool_request, dict):
         sanitized["tool_request"] = {
             key: _safe_diagnostic_value(tool_request.get(key))
-            for key in ("name", "check_id", "limit", "rationale")
+            for key in (
+                "name",
+                "check_id",
+                "limit",
+                "rationale",
+                "question_id",
+                "question",
+                "hypothesis_ids",
+            )
         }
     conclusion = payload.get("conclusion")
     if isinstance(conclusion, dict):
@@ -1096,18 +1458,22 @@ def _recommended_actions(diagnosis_code: str) -> list[str]:
 
 
 _SYSTEM_PROMPT = """You investigate data-pipeline incidents using only the supplied observable
-incident, canonical evidence registry, and contracts. Maintain hypotheses through explicit create,
-update, confirm, and reject operations; never restate the full hypothesis list. IDs are stable after
-creation. Evidence fields contain bare IDs only, selected from supportable_evidence_ids. Never put
-prose, summaries, or annotated IDs in evidence fields. Confirming requires supporting evidence, and
-a final diagnosis must match a confirmed hypothesis and cite its support. Select at most one
-currently available tool when evidence is insufficient. check_id must come from available_check_ids.
-Investigation paths follow findings rather than a fixed sequence. Conclude as soon as evidence is
-sufficient; unused budget is not a reason to collect more. Conclude with insufficient_evidence when
-available tools cannot resolve the uncertainty. Choose diagnosis_code only from diagnosis_taxonomy.
-Prefer a directly established defect that explains secondary symptoms over treating every validation
-symptom as an independent cause. Completed calls are an execution ledger, and absent tools must not
-be selected. Return the requested structured decision."""
+incident, canonical evidence registry, investigation memory, and tool-capability catalog. Maintain
+hypotheses through explicit create, update, confirm, and reject operations; never restate the full
+hypothesis list. IDs are stable after creation. Evidence fields contain bare IDs only, selected from
+citable_evidence_ids. A citable result is not automatically support: use it only when its facts
+establish the proposed mechanism. Never put prose or annotated IDs in evidence fields. Confirming
+requires supporting evidence, and a final diagnosis must match a confirmed hypothesis and cite its
+support. Before a tool action, identify one concise unanswered causal question using a new
+question_id and list the hypothesis IDs it distinguishes. Select the capability that answers that
+question and respect its limitations. Do not repeat an investigated question or an equivalent tool
+request. check_id must come from available_check_ids. Investigation paths follow findings rather
+than a fixed sequence. Revise or reject a hypothesis when hypothesis_checks identifies factual
+contradictions. Conclude as soon as evidence is sufficient; unused budget is not a reason to collect
+more. Conclude with insufficient_evidence only after available operational evidence sources are
+exhausted. Choose diagnosis_code only from diagnosis_taxonomy. Validation failures are symptoms,
+not upstream diagnoses. Develop competing causal hypotheses, seek discriminating facts, and
+distinguish timing or correlation from causal evidence. Return the requested structured decision."""
 
 
 _OLLAMA_SYSTEM_PROMPT = f"""{_SYSTEM_PROMPT}

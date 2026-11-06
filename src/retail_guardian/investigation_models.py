@@ -9,6 +9,28 @@ from typing import Any, Literal
 
 from retail_guardian.models import _json_ready
 
+QUALITY_DIAGNOSIS_CODES = (
+    "schema_change",
+    "duplicate_records",
+    "currency_mismatch",
+    "missing_values",
+    "unexpected_categories",
+    "delayed_data",
+    "statistical_price_anomaly",
+)
+
+ROOT_CAUSE_DIAGNOSIS_CODES = (
+    "supplier_batch_replay",
+    "failed_job_retry",
+    "incorrect_join_cardinality",
+    "source_system_omission",
+    "transformation_logic_error",
+    "supplier_data_error",
+    "legitimate_taxonomy_update",
+    "late_supplier_delivery",
+    "scheduler_backlog",
+)
+
 
 class ConfidenceLevel(StrEnum):
     HIGH = "high"
@@ -35,6 +57,12 @@ class ToolResultKind(StrEnum):
     EMPTY = "empty"
     INVALID = "invalid"
     DUPLICATE = "duplicate"
+
+
+class QuestionStatus(StrEnum):
+    ANSWERED = "answered"
+    UNAVAILABLE = "unavailable"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -90,6 +118,7 @@ class InvestigationReport:
     tools_used: list[str]
     conclusion: InvestigationConclusion
     tool_call_count: int
+    investigation_questions: list[InvestigationQuestion] = field(default_factory=list)
     token_usage: int | None = None
     duration_seconds: float = 0.0
     decision_count: int = 0
@@ -105,7 +134,7 @@ class InvestigationReport:
     timeouts: int = 0
     provider_name: str = "unknown"
     model_name: str = "unknown"
-    schema_version: str = "3.0"
+    schema_version: str = "3.1"
 
     def to_dict(self) -> dict[str, Any]:
         return _json_ready(asdict(self))
@@ -123,6 +152,8 @@ class ToolDefinition:
     name: str
     description: str
     parameters: dict[str, Any]
+    answers: tuple[str, ...] = ()
+    limitations: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,6 +161,20 @@ class ToolRequest:
     name: str
     arguments: dict[str, Any]
     rationale: str
+    question_id: str | None = None
+    question: str | None = None
+    hypothesis_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class InvestigationQuestion:
+    question_id: str
+    question: str
+    hypothesis_ids: list[str]
+    tool_name: str
+    arguments: dict[str, Any]
+    status: QuestionStatus
+    evidence_id: str
 
 
 @dataclass(frozen=True)
@@ -174,6 +219,8 @@ class ProviderTelemetry:
     duration_seconds: float = 0.0
     first_attempt_schema_valid_decisions: int = 0
     retry_recoveries: int = 0
+    token_usage: int = 0
+    token_usage_available: bool = False
     rejected_decisions: list[RejectedDecisionDiagnostic] = field(default_factory=list)
 
 
@@ -188,3 +235,9 @@ class InvestigationContext:
     remaining_invalid_tool_calls: int = 3
     available_check_ids: list[str] = field(default_factory=list)
     remaining_empty_tool_calls: int = 2
+    remaining_duplicate_tool_calls: int = 2
+    investigation_questions: list[InvestigationQuestion] = field(default_factory=list)
+    investigation_objective: str = "classify_observable_failure"
+    allowed_diagnosis_codes: list[str] = field(
+        default_factory=lambda: list(QUALITY_DIAGNOSIS_CODES)
+    )

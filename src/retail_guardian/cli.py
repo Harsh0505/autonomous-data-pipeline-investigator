@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from retail_guardian.causal_scenarios import ROOT_CAUSE_CASES, run_root_cause_scenario
 from retail_guardian.evaluation import BenchmarkEvaluator
 from retail_guardian.investigation import InvestigationAgent
 from retail_guardian.providers import (
@@ -14,6 +15,7 @@ from retail_guardian.providers import (
     OllamaInvestigationModel,
     OpenAIInvestigationModel,
 )
+from retail_guardian.root_cause_evaluation import RootCauseBenchmarkEvaluator
 from retail_guardian.scenarios import SCENARIOS, run_scenario
 from retail_guardian.storage import SQLiteHistoryRepository
 
@@ -36,6 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
     run_parser.add_argument("--database", type=Path, default=None)
+    causal_parser = subparsers.add_parser(
+        "run-root-cause", help="Generate an opaque upstream root-cause scenario"
+    )
+    causal_parser.add_argument("--case", choices=ROOT_CAUSE_CASES, default=ROOT_CAUSE_CASES[0])
+    causal_parser.add_argument("--rows", type=int, default=500)
+    causal_parser.add_argument("--seed", type=int, default=42)
+    causal_parser.add_argument("--as-of", type=_parse_datetime, default=None)
+    causal_parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
+    causal_parser.add_argument("--database", type=Path, default=None)
     subparsers.add_parser("list-scenarios", help="List available example scenarios")
     investigate_parser = subparsers.add_parser(
         "investigate", help="Autonomously investigate a persisted incident"
@@ -51,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     investigate_parser.add_argument("--model-retries", type=int, default=2)
     investigate_parser.add_argument("--max-tool-calls", type=int, default=8)
     investigate_parser.add_argument("--max-invalid-tool-calls", type=int, default=3)
+    investigate_parser.add_argument("--max-duplicate-tool-calls", type=int, default=2)
     investigate_parser.add_argument("--max-empty-tool-calls", type=int, default=2)
     investigate_parser.add_argument("--output", type=Path, default=None)
     benchmark_parser = subparsers.add_parser(
@@ -68,8 +80,30 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument("--seed", type=int, default=42)
     benchmark_parser.add_argument("--max-tool-calls", type=int, default=8)
     benchmark_parser.add_argument("--max-invalid-tool-calls", type=int, default=3)
+    benchmark_parser.add_argument("--max-duplicate-tool-calls", type=int, default=2)
     benchmark_parser.add_argument("--max-empty-tool-calls", type=int, default=2)
     benchmark_parser.add_argument("--output", type=Path, default=None)
+    root_benchmark_parser = subparsers.add_parser(
+        "root-cause-benchmark",
+        help="Evaluate ambiguous upstream causal investigations",
+    )
+    root_benchmark_parser.add_argument(
+        "--database", type=Path, default=Path("artifacts/root-cause-benchmark.db")
+    )
+    root_benchmark_parser.add_argument(
+        "--provider", choices=("mock", "ollama", "openai"), default="ollama"
+    )
+    root_benchmark_parser.add_argument("--model", default=None)
+    root_benchmark_parser.add_argument("--endpoint", default=None)
+    root_benchmark_parser.add_argument("--timeout", type=float, default=120.0)
+    root_benchmark_parser.add_argument("--model-retries", type=int, default=2)
+    root_benchmark_parser.add_argument("--rows", type=int, default=500)
+    root_benchmark_parser.add_argument("--seed", type=int, default=42)
+    root_benchmark_parser.add_argument("--max-tool-calls", type=int, default=8)
+    root_benchmark_parser.add_argument("--max-invalid-tool-calls", type=int, default=3)
+    root_benchmark_parser.add_argument("--max-duplicate-tool-calls", type=int, default=2)
+    root_benchmark_parser.add_argument("--max-empty-tool-calls", type=int, default=2)
+    root_benchmark_parser.add_argument("--output", type=Path, default=None)
     trace_parser = subparsers.add_parser(
         "trace", help="Print a persisted investigation decision and tool trace"
     )
@@ -87,8 +121,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_investigation(args)
     if args.command == "benchmark":
         return _run_benchmark(args)
+    if args.command == "root-cause-benchmark":
+        return _run_root_cause_benchmark(args)
     if args.command == "trace":
         return _show_trace(args)
+    if args.command == "run-root-cause":
+        return _run_root_cause_scenario(args)
 
     as_of = args.as_of or datetime.now(UTC)
     output_dir: Path = args.output_dir
@@ -132,6 +170,7 @@ def _run_investigation(args: argparse.Namespace) -> int:
             model,
             max_tool_calls=args.max_tool_calls,
             max_invalid_tool_calls=args.max_invalid_tool_calls,
+            max_duplicate_tool_calls=args.max_duplicate_tool_calls,
             max_empty_tool_calls=args.max_empty_tool_calls,
         ).investigate(args.incident_id)
     except (RuntimeError, ValueError) as exc:
@@ -159,10 +198,69 @@ def _run_benchmark(args: argparse.Namespace) -> int:
                 ),
                 max_tool_calls=args.max_tool_calls,
                 max_invalid_tool_calls=args.max_invalid_tool_calls,
+                max_duplicate_tool_calls=args.max_duplicate_tool_calls,
                 max_empty_tool_calls=args.max_empty_tool_calls,
             )
 
         summary = BenchmarkEvaluator(repository, agent_factory).run(
+            row_count=args.rows,
+            seed=args.seed,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    output = json.dumps(summary.to_dict(), indent=2, sort_keys=True)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(output + "\n", encoding="utf-8")
+    print(output)
+    return 1 if summary.investigation_failures or summary.timeouts else 0
+
+
+def _run_root_cause_scenario(args: argparse.Namespace) -> int:
+    as_of = args.as_of or datetime.now(UTC)
+    output_dir: Path = args.output_dir
+    database = args.database or output_dir / "history.db"
+    repository = SQLiteHistoryRepository(database)
+    try:
+        scenario = run_root_cause_scenario(
+            args.case,
+            row_count=args.rows,
+            seed=args.seed,
+            as_of=as_of,
+            repository=repository,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    report_path = output_dir / f"{args.case}-incident.json"
+    scenario.pipeline_run.report.write(report_path)
+    print(scenario.pipeline_run.report.to_json())
+    print(f"Report written to {report_path}", file=sys.stderr)
+    return 1
+
+
+def _run_root_cause_benchmark(args: argparse.Namespace) -> int:
+    try:
+        repository = SQLiteHistoryRepository(args.database)
+
+        def agent_factory() -> InvestigationAgent:
+            return InvestigationAgent(
+                repository,
+                _build_model(
+                    args.provider,
+                    args.model,
+                    endpoint=args.endpoint,
+                    timeout=args.timeout,
+                    model_retries=args.model_retries,
+                ),
+                max_tool_calls=args.max_tool_calls,
+                max_invalid_tool_calls=args.max_invalid_tool_calls,
+                max_duplicate_tool_calls=args.max_duplicate_tool_calls,
+                max_empty_tool_calls=args.max_empty_tool_calls,
+            )
+
+        summary = RootCauseBenchmarkEvaluator(repository, agent_factory).run(
             row_count=args.rows,
             seed=args.seed,
         )

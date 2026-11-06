@@ -47,6 +47,18 @@ class HistoryRepository(Protocol):
         self, *, before_ingested_at: str | None = None, limit: int = 10
     ) -> list[dict[str, Any]]: ...
 
+    def save_operational_records(
+        self, execution_id: str, records: list[dict[str, Any]]
+    ) -> None: ...
+
+    def get_operational_records(
+        self,
+        execution_id: str,
+        record_type: str | None = None,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]: ...
+
     def start_investigation(
         self, investigation_id: str, incident_id: str, started_at: datetime
     ) -> None: ...
@@ -150,6 +162,14 @@ class SQLiteHistoryRepository:
                     record_json TEXT NOT NULL,
                     PRIMARY KEY (execution_id, check_id, sample_index)
                 );
+                CREATE TABLE IF NOT EXISTS operational_record (
+                    record_id TEXT PRIMARY KEY,
+                    execution_id TEXT NOT NULL REFERENCES pipeline_execution(execution_id),
+                    record_type TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    component TEXT NOT NULL,
+                    details_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS investigation_session (
                     investigation_id TEXT PRIMARY KEY,
                     incident_id TEXT NOT NULL REFERENCES incident(incident_id),
@@ -208,6 +228,8 @@ class SQLiteHistoryRepository:
                     ON pipeline_execution(ingestion_timestamp DESC);
                 CREATE INDEX IF NOT EXISTS investigation_incident_idx
                     ON investigation_session(incident_id, started_at DESC);
+                CREATE INDEX IF NOT EXISTS operational_record_execution_idx
+                    ON operational_record(execution_id, record_type, occurred_at);
                 """
             )
             columns = {
@@ -412,6 +434,63 @@ class SQLiteHistoryRepository:
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_execution_dict(row) for row in rows]
+
+    def save_operational_records(self, execution_id: str, records: list[dict[str, Any]]) -> None:
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM pipeline_execution WHERE execution_id = ?", (execution_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"execution not found: {execution_id}")
+            connection.execute(
+                "DELETE FROM operational_record WHERE execution_id = ?", (execution_id,)
+            )
+            connection.executemany(
+                """INSERT INTO operational_record
+                   (record_id, execution_id, record_type, occurred_at, component, details_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        str(record["record_id"]),
+                        execution_id,
+                        str(record["record_type"]),
+                        str(record["occurred_at"]),
+                        str(record["component"]),
+                        _dump(record["details"]),
+                    )
+                    for record in records
+                ],
+            )
+
+    def get_operational_records(
+        self,
+        execution_id: str,
+        record_type: str | None = None,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        query = (
+            "SELECT record_id, record_type, occurred_at, component, details_json "
+            "FROM operational_record WHERE execution_id = ?"
+        )
+        parameters: list[Any] = [execution_id]
+        if record_type is not None:
+            query += " AND record_type = ?"
+            parameters.append(record_type)
+        query += " ORDER BY occurred_at, record_id LIMIT ?"
+        parameters.append(max(1, min(limit, 100)))
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            {
+                "record_id": row["record_id"],
+                "record_type": row["record_type"],
+                "occurred_at": row["occurred_at"],
+                "component": row["component"],
+                "details": json.loads(row["details_json"]),
+            }
+            for row in rows
+        ]
 
     def start_investigation(
         self, investigation_id: str, incident_id: str, started_at: datetime

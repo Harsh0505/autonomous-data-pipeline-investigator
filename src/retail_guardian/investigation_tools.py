@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
+from retail_guardian.causal_scenarios import OperationalRecordType
 from retail_guardian.config import PipelineConfig
-from retail_guardian.investigation_models import Evidence, ToolDefinition, ToolResultKind
+from retail_guardian.investigation_models import (
+    QUALITY_DIAGNOSIS_CODES,
+    ROOT_CAUSE_DIAGNOSIS_CODES,
+    Evidence,
+    ToolDefinition,
+    ToolResultKind,
+)
 from retail_guardian.storage import HistoryRepository
 
 
@@ -27,6 +35,9 @@ class InvestigationToolbox:
             raise ValueError(f"incident not found: {incident_id}")
         self.execution = execution
         self.execution_id = str(execution["execution_id"])
+        self.operational_evidence_available = bool(
+            repository.get_operational_records(self.execution_id, limit=1)
+        )
         self._tools: dict[str, Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]] = {
             "inspect_dataset": self._inspect_dataset,
             "get_validation_failures": self._get_validation_failures,
@@ -36,6 +47,11 @@ class InvestigationToolbox:
             "get_pipeline_history": self._get_pipeline_history,
             "identify_affected_dimensions": self._identify_affected_dimensions,
             "get_data_contract": self._get_data_contract,
+            "get_pipeline_logs": self._get_pipeline_logs,
+            "get_supplier_submissions": self._get_supplier_submissions,
+            "get_orchestration_events": self._get_orchestration_events,
+            "get_transformation_metadata": self._get_transformation_metadata,
+            "get_configuration_changes": self._get_configuration_changes,
         }
 
     @property
@@ -45,51 +61,142 @@ class InvestigationToolbox:
             "required": False,
             "enum": self.available_check_ids,
         }
-        return [
+        definitions = [
             ToolDefinition(
                 "inspect_dataset",
-                "Inspect schema, nulls, cardinality, numeric summaries, and aggregates.",
+                "Current dataset profile: schema, nulls, cardinality, numeric summaries, "
+                "and aggregates.",
                 {},
+                ("What does the current dataset contain?",),
+                "Describes symptoms, not upstream execution causes.",
             ),
             ToolDefinition(
                 "get_validation_failures",
-                "Retrieve measured validation failures for the current execution.",
+                "Measured validation failures for the current execution.",
                 {},
+                ("Which deterministic or statistical checks failed?",),
+                "Identifies observed symptoms but not their upstream cause.",
             ),
             ToolDefinition(
                 "compare_schemas",
-                "Compare the current schema with the most relevant prior execution.",
+                "Current schema compared with the most relevant prior execution.",
                 {},
+                ("Did columns or data types change from a prior run?",),
+                "Requires a prior comparable execution and covers schema only.",
             ),
             ToolDefinition(
                 "compare_distributions",
-                "Compare numeric distributions and dimension aggregates with a prior execution.",
+                "Numeric distributions and dimension aggregates compared with a prior execution.",
                 {},
+                ("Did values or dimension volumes shift from a prior run?",),
+                "Requires a prior comparable execution; correlation is not causal proof.",
             ),
             ToolDefinition(
                 "sample_problematic_records",
-                "Inspect a bounded sample of records implicated by a validation check.",
+                "Bounded records implicated by one validation check.",
                 {
                     "check_id": check_id_parameter,
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "limit": {
+                        "type": "integer",
+                        "required": False,
+                        "minimum": 1,
+                        "maximum": 20,
+                    },
                 },
+                ("What values appear in records affected by a failed check?",),
+                "A sample is not a complete population or operational audit trail.",
             ),
             ToolDefinition(
                 "get_pipeline_history",
-                "List prior pipeline executions with event and ingestion timestamps kept separate.",
-                {"limit": {"type": "integer", "minimum": 1, "maximum": 20}},
+                "Prior healthy executions with separate event and ingestion timestamps.",
+                {
+                    "limit": {
+                        "type": "integer",
+                        "required": False,
+                        "minimum": 1,
+                        "maximum": 20,
+                    }
+                },
+                ("Is the current execution unusual relative to earlier healthy runs?",),
+                "Does not expose task retries, writes, lineage, or supplier submissions.",
             ),
             ToolDefinition(
                 "identify_affected_dimensions",
-                "Summarize suppliers and categories present in sampled problematic records.",
+                "Supplier and category counts from sampled problematic records.",
                 {"check_id": check_id_parameter},
+                ("Which sampled dimensions are affected?",),
+                "Sample-scoped; does not establish the causal mechanism.",
             ),
             ToolDefinition(
                 "get_data_contract",
-                "Retrieve columns, supplier currencies, categories, and validation thresholds.",
+                "Configured columns, currencies, categories, and validation thresholds.",
                 {},
+                ("What data rules currently apply?",),
+                "Static contract state does not show execution, retry, or delivery events.",
             ),
         ]
+        if self.operational_evidence_available:
+            definitions.extend(
+                [
+                    ToolDefinition(
+                        "get_pipeline_logs",
+                        "Execution log events, including component writes and timestamps.",
+                        {},
+                        ("What did pipeline components execute or persist?",),
+                        "Bounded to the current execution; orchestration state is separate.",
+                    ),
+                    ToolDefinition(
+                        "get_supplier_submissions",
+                        "Supplier manifests, batch IDs, checksums, arrival times, and field "
+                        "statistics.",
+                        {},
+                        ("What payloads arrived, when, and with which source-level properties?",),
+                        "Does not show internal task retries, writes, or transformations.",
+                    ),
+                    ToolDefinition(
+                        "get_orchestration_events",
+                        "Task attempts, failures, retry triggers, queue timing, and "
+                        "scheduler state.",
+                        {},
+                        ("Did orchestration retry, fail, or queue the execution?",),
+                        "Does not prove which rows were written or transformed.",
+                    ),
+                    ToolDefinition(
+                        "get_transformation_metadata",
+                        "Transformation lineage, row counts, join cardinality, and "
+                        "conversion outcomes.",
+                        {},
+                        ("Did transformation logic multiply, lose, or alter source values?",),
+                        "Does not show supplier delivery or scheduler behavior.",
+                    ),
+                    ToolDefinition(
+                        "get_configuration_changes",
+                        "Approved, deployed, and runtime-loaded configuration versions.",
+                        {},
+                        ("Was a relevant configuration change approved and loaded?",),
+                        "Does not describe source payload contents or task execution.",
+                    ),
+                ]
+            )
+        return definitions
+
+    @property
+    def investigation_objective(self) -> str:
+        if self.operational_evidence_available:
+            return "identify_underlying_root_cause"
+        return "classify_observable_failure"
+
+    @property
+    def allowed_diagnosis_codes(self) -> list[str]:
+        codes = (
+            ROOT_CAUSE_DIAGNOSIS_CODES
+            if self.operational_evidence_available
+            else QUALITY_DIAGNOSIS_CODES
+        )
+        return sorted(
+            codes,
+            key=lambda code: sha256(f"{self.incident_id}:{code}".encode()).digest(),
+        )
 
     @property
     def available_check_ids(self) -> list[str]:
@@ -107,7 +214,13 @@ class InvestigationToolbox:
             "get_validation_failures",
             "compare_schemas",
             "compare_distributions",
+            "get_pipeline_history",
             "get_data_contract",
+            "get_pipeline_logs",
+            "get_supplier_submissions",
+            "get_orchestration_events",
+            "get_transformation_metadata",
+            "get_configuration_changes",
         }
 
     def execute(self, name: str, arguments: dict[str, Any] | None = None) -> Evidence:
@@ -302,6 +415,45 @@ class InvestigationToolbox:
             "unit_price_z_score_threshold": self.config.anomaly_z_score_threshold,
         }
 
+    def _get_pipeline_logs(self, _: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        return self._operational_records(OperationalRecordType.PIPELINE_LOG, "pipeline log")
+
+    def _get_supplier_submissions(self, _: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        return self._operational_records(
+            OperationalRecordType.SUPPLIER_SUBMISSION, "supplier submission"
+        )
+
+    def _get_orchestration_events(self, _: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        return self._operational_records(
+            OperationalRecordType.ORCHESTRATION_EVENT, "orchestration event"
+        )
+
+    def _get_transformation_metadata(self, _: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        return self._operational_records(
+            OperationalRecordType.TRANSFORMATION_METADATA, "transformation record"
+        )
+
+    def _get_configuration_changes(self, _: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        return self._operational_records(
+            OperationalRecordType.CONFIGURATION_CHANGE, "configuration change"
+        )
+
+    def _operational_records(
+        self, record_type: OperationalRecordType, label: str
+    ) -> tuple[str, dict[str, Any]]:
+        records = self.repository.get_operational_records(
+            self.execution_id, record_type.value, limit=50
+        )
+        return f"Retrieved {len(records)} {label} record(s)", {
+            "records": records,
+            "coverage": {
+                "complete": True,
+                "execution_id": self.execution_id,
+                "record_type": record_type.value,
+                "record_count": len(records),
+            },
+        }
+
     def _previous_execution(self) -> dict[str, Any] | None:
         history = self.repository.list_executions(
             before_ingested_at=str(self.execution["ingestion_timestamp"]), limit=20
@@ -382,6 +534,14 @@ def _classify_result(name: str, data: dict[str, Any]) -> ToolResultKind:
     if name in {"compare_schemas", "compare_distributions"} and not data.get(
         "sufficient_history", False
     ):
+        return ToolResultKind.EMPTY
+    if name in {
+        "get_pipeline_logs",
+        "get_supplier_submissions",
+        "get_orchestration_events",
+        "get_transformation_metadata",
+        "get_configuration_changes",
+    } and not data.get("records"):
         return ToolResultKind.EMPTY
     return ToolResultKind.INFORMATIVE
 

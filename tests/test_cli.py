@@ -88,3 +88,52 @@ def test_cli_mock_benchmark_writes_distinguished_results(tmp_path, capsys) -> No
     assert payload["evaluation_type"] == "deterministic_mock"
     assert payload["provider_name"] == "mock"
     assert len(payload["cases"]) == 6
+
+
+def test_cli_generates_opaque_root_cause_case(tmp_path, capsys) -> None:
+    exit_code = main(
+        [
+            "run-root-cause",
+            "--case",
+            "case-003",
+            "--rows",
+            "50",
+            "--seed",
+            "9",
+            "--as-of",
+            "2026-10-20T12:00:00Z",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert payload["status"] == "incident"
+    assert "incorrect_join_cardinality" not in json.dumps(payload)
+    assert (tmp_path / "case-003-incident.json").is_file()
+
+
+def test_cli_root_cause_benchmark_is_separate_from_regression_suite(tmp_path, capsys) -> None:
+    output = tmp_path / "root-cause-evaluation.json"
+
+    exit_code = main(
+        [
+            "root-cause-benchmark",
+            "--provider",
+            "mock",
+            "--rows",
+            "50",
+            "--database",
+            str(tmp_path / "root-cause.db"),
+            "--output",
+            str(output),
+        ]
+    )
+    capsys.readouterr()
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert payload["benchmark_scope"] == "ambiguous_upstream_root_cause"
+    assert len(payload["cases"]) == 10
+    assert payload["provider_name"] == "mock"

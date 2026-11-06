@@ -7,6 +7,12 @@ from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
+from retail_guardian.causal_evidence import (
+    CausalEvidenceError,
+    evidence_is_unavailable,
+    require_causal_evidence_alignment,
+    require_causal_support,
+)
 from retail_guardian.hypothesis_state import (
     HypothesisTransitionError,
     apply_hypothesis_operations,
@@ -16,10 +22,13 @@ from retail_guardian.investigation_models import (
     CompletedToolCall,
     ConfidenceLevel,
     Evidence,
+    HypothesisOperationType,
     InvestigationConclusion,
     InvestigationContext,
+    InvestigationQuestion,
     InvestigationReport,
     ModelDecision,
+    QuestionStatus,
     RootCauseHypothesis,
     ToolResultKind,
 )
@@ -44,6 +53,7 @@ class _InvestigationState(TypedDict):
     invalid_tool_calls: int
     tool_request_signatures: list[str]
     completed_tool_calls: list[CompletedToolCall]
+    investigation_questions: list[InvestigationQuestion]
     persisted_rejection_count: int
     token_usage: int
     fatal_model_error: bool
@@ -62,6 +72,7 @@ class InvestigationAgent:
         max_tool_calls: int = 8,
         max_invalid_tool_calls: int = 3,
         max_empty_tool_calls: int = 2,
+        max_duplicate_tool_calls: int = 2,
     ) -> None:
         if max_tool_calls < 1:
             raise ValueError("max_tool_calls must be at least 1")
@@ -69,11 +80,14 @@ class InvestigationAgent:
             raise ValueError("max_invalid_tool_calls must be at least 1")
         if max_empty_tool_calls < 1:
             raise ValueError("max_empty_tool_calls must be at least 1")
+        if max_duplicate_tool_calls < 1:
+            raise ValueError("max_duplicate_tool_calls must be at least 1")
         self.repository = repository
         self.model = model
         self.max_tool_calls = max_tool_calls
         self.max_invalid_tool_calls = max_invalid_tool_calls
         self.max_empty_tool_calls = max_empty_tool_calls
+        self.max_duplicate_tool_calls = max_duplicate_tool_calls
         self._toolbox: InvestigationToolbox | None = None
         self.graph = self._build_graph()
 
@@ -101,6 +115,7 @@ class InvestigationAgent:
             "invalid_tool_calls": 0,
             "tool_request_signatures": [],
             "completed_tool_calls": [],
+            "investigation_questions": [],
             "persisted_rejection_count": 0,
             "token_usage": 0,
             "fatal_model_error": False,
@@ -111,7 +126,10 @@ class InvestigationAgent:
             initial_state,
             config={
                 "recursion_limit": (
-                    self.max_tool_calls + self.max_invalid_tool_calls + self.max_empty_tool_calls
+                    self.max_tool_calls
+                    + self.max_invalid_tool_calls
+                    + self.max_empty_tool_calls
+                    + self.max_duplicate_tool_calls
                 )
                 * 3
                 + 6
@@ -147,6 +165,7 @@ class InvestigationAgent:
             self.max_invalid_tool_calls - state["invalid_tool_calls"] - provider_invalid_calls,
         )
         remaining_empty = max(0, self.max_empty_tool_calls - state["empty_tool_calls"])
+        remaining_duplicate = max(0, self.max_duplicate_tool_calls - state["duplicate_tool_calls"])
         completed_non_repeatable = {
             call.name
             for call in state["completed_tool_calls"]
@@ -167,12 +186,46 @@ class InvestigationAgent:
             remaining_invalid_tool_calls=remaining_invalid,
             available_check_ids=toolbox.available_check_ids,
             remaining_empty_tool_calls=remaining_empty,
+            remaining_duplicate_tool_calls=remaining_duplicate,
+            investigation_questions=state["investigation_questions"],
+            investigation_objective=toolbox.investigation_objective,
+            allowed_diagnosis_codes=toolbox.allowed_diagnosis_codes,
         )
         try:
             decision = self.model.decide(context)
             next_hypotheses = _apply_decision_hypotheses(
                 state["hypotheses"], decision, state["evidence"]
             )
+            confirmed_ids = {
+                operation.hypothesis_id
+                for operation in decision.hypothesis_operations
+                if operation.operation == HypothesisOperationType.CONFIRM
+            }
+            hypotheses_by_id = {
+                hypothesis.hypothesis_id: hypothesis for hypothesis in next_hypotheses
+            }
+            for operation in decision.hypothesis_operations:
+                hypothesis = hypotheses_by_id[operation.hypothesis_id]
+                if hypothesis.diagnosis_code is not None:
+                    require_causal_evidence_alignment(
+                        hypothesis.diagnosis_code,
+                        hypothesis.supporting_evidence,
+                        hypothesis.contradicting_evidence,
+                        state["evidence"],
+                        require_contradiction=(
+                            operation.operation == HypothesisOperationType.REJECT
+                        ),
+                    )
+            for hypothesis in next_hypotheses:
+                if (
+                    hypothesis.hypothesis_id in confirmed_ids
+                    and hypothesis.diagnosis_code is not None
+                ):
+                    require_causal_support(
+                        hypothesis.diagnosis_code,
+                        hypothesis.supporting_evidence,
+                        state["evidence"],
+                    )
             fatal_model_error = False
         except Exception as exc:  # Provider and transition errors become explicit failures.
             fatal_model_error = True
@@ -185,27 +238,33 @@ class InvestigationAgent:
                 ),
             )
         request_limit_reached = state["tool_call_count"] >= (
-            self.max_tool_calls + self.max_invalid_tool_calls + self.max_empty_tool_calls
+            self.max_tool_calls
+            + self.max_invalid_tool_calls
+            + self.max_empty_tool_calls
+            + self.max_duplicate_tool_calls
         )
         invalid_request_limit_reached = False
+        duplicate_request_limit_reached = False
         if decision.action == "tool" and decision.tool_request is not None:
             request = decision.tool_request
             signature = _tool_request_signature(request.name, request.arguments)
-            invalid_request = (
-                toolbox.validate_request(request.name, request.arguments) is not None
-                or signature in state["tool_request_signatures"]
-            )
+            invalid_request = toolbox.validate_request(request.name, request.arguments) is not None
+            duplicate_request = signature in state["tool_request_signatures"]
             invalid_request_limit_reached = invalid_request and remaining_invalid <= 0
+            duplicate_request_limit_reached = duplicate_request and remaining_duplicate <= 0
         if decision.action == "tool" and (
             decision.tool_request is None
             or remaining <= 0
             or request_limit_reached
             or invalid_request_limit_reached
+            or duplicate_request_limit_reached
             or remaining_empty <= 0
         ):
             reason = "The investigation reached its successful tool-call budget"
             if invalid_request_limit_reached:
                 reason = "The investigation reached its invalid tool-request limit"
+            elif duplicate_request_limit_reached:
+                reason = "The investigation reached its duplicate tool-request limit"
             elif request_limit_reached and remaining > 0:
                 reason = "The investigation reached its total tool-request safety limit"
             elif remaining_empty <= 0:
@@ -215,6 +274,11 @@ class InvestigationAgent:
                 hypotheses=[],
                 conclusion=_inconclusive_conclusion(state["evidence"], reason),
                 token_usage=decision.token_usage,
+            )
+            fatal_model_error = (
+                fatal_model_error
+                or invalid_request_limit_reached
+                or duplicate_request_limit_reached
             )
         rejections = getattr(telemetry, "rejected_decisions", [])
         for sequence, rejection in enumerate(
@@ -263,6 +327,21 @@ class InvestigationAgent:
             evidence = self._require_toolbox().execute(request.name, request.arguments)
         completed_at = datetime.now(UTC)
         sequence = state["tool_call_count"] + 1
+        question = InvestigationQuestion(
+            request.question_id or f"Q-{sequence:03d}",
+            request.question or request.rationale,
+            request.hypothesis_ids,
+            request.name,
+            request.arguments,
+            (
+                QuestionStatus.FAILED
+                if evidence.result_kind in {ToolResultKind.INVALID, ToolResultKind.DUPLICATE}
+                else QuestionStatus.UNAVAILABLE
+                if evidence_is_unavailable(evidence)
+                else QuestionStatus.ANSWERED
+            ),
+            evidence.evidence_id,
+        )
         self.repository.record_tool_call(
             state["investigation_id"],
             sequence,
@@ -285,7 +364,7 @@ class InvestigationAgent:
             "duplicate_tool_calls": state["duplicate_tool_calls"]
             + int(evidence.result_kind == ToolResultKind.DUPLICATE),
             "invalid_tool_calls": state["invalid_tool_calls"]
-            + int(evidence.result_kind in {ToolResultKind.INVALID, ToolResultKind.DUPLICATE}),
+            + int(evidence.result_kind == ToolResultKind.INVALID),
             "tool_request_signatures": [*state["tool_request_signatures"], signature],
             "completed_tool_calls": [
                 *state["completed_tool_calls"],
@@ -298,6 +377,7 @@ class InvestigationAgent:
                     evidence.result_kind,
                 ),
             ],
+            "investigation_questions": [*state["investigation_questions"], question],
             "pending_decision": None,
         }
 
@@ -316,7 +396,12 @@ class InvestigationAgent:
                     conclusion.evidence_references,
                     state["hypotheses"],
                 )
-            except HypothesisTransitionError as exc:
+                require_causal_support(
+                    conclusion.diagnosis_code,
+                    conclusion.evidence_references,
+                    state["evidence"],
+                )
+            except (HypothesisTransitionError, CausalEvidenceError) as exc:
                 conclusion = _inconclusive_conclusion(state["evidence"], str(exc))
         status = "completed"
         if state["fatal_model_error"]:
@@ -325,6 +410,11 @@ class InvestigationAgent:
             status = "inconclusive"
         completed_at = datetime.now(UTC)
         telemetry = getattr(self.model, "telemetry", None)
+        token_usage = (
+            getattr(telemetry, "token_usage", 0)
+            if getattr(telemetry, "token_usage_available", False)
+            else (state["token_usage"] or None)
+        )
         report = InvestigationReport(
             investigation_id=state["investigation_id"],
             incident_id=str(state["incident"]["incident_id"]),
@@ -336,7 +426,8 @@ class InvestigationAgent:
             tools_used=state["tools_used"],
             conclusion=conclusion,
             tool_call_count=state["tool_call_count"],
-            token_usage=state["token_usage"] or None,
+            investigation_questions=state["investigation_questions"],
+            token_usage=token_usage,
             duration_seconds=round((completed_at - state["started_at"]).total_seconds(), 6),
             decision_count=state["decision_count"],
             invalid_tool_calls=state["invalid_tool_calls"]
@@ -433,4 +524,13 @@ def _inconclusive_conclusion(evidence: list[Evidence], reason: str) -> Investiga
 
 
 def _tool_request_signature(name: str, arguments: dict[str, Any]) -> str:
-    return json.dumps({"name": name, "arguments": arguments}, sort_keys=True)
+    defaults: dict[str, dict[str, Any]] = {
+        "sample_problematic_records": {"check_id": None, "limit": 10},
+        "get_pipeline_history": {"limit": 10},
+        "identify_affected_dimensions": {"check_id": None},
+    }
+    normalized_arguments = {**defaults.get(name, {}), **arguments}
+    return json.dumps(
+        {"name": name, "arguments": normalized_arguments},
+        sort_keys=True,
+    )

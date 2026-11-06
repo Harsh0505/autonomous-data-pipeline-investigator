@@ -1,18 +1,21 @@
-# Retail Pipeline Guardian — Investigation reliability hardening
+# Retail Pipeline Guardian — Autonomous root-cause investigation
 
 Retail Pipeline Guardian detects failures in synthetic multi-supplier retail feeds and investigates
-incidents through a bounded, evidence-driven LangGraph workflow. It supports real local inference
-through Ollama while preserving the deterministic test provider and optional OpenAI provider.
-Autonomous repair, FastAPI, the frontend, and an ambiguous root-cause benchmark remain out of scope.
+incidents through a bounded, evidence-driven LangGraph workflow. In addition to classifying data
+quality failures, version 0.4.0 investigates competing upstream causal mechanisms from operational
+evidence. It supports real local inference through Ollama while preserving the deterministic test
+provider and optional OpenAI provider. Autonomous repair, FastAPI, and the frontend remain out of
+scope.
 
 The project can run real autonomous investigations locally without API credentials or paid services.
 
 ## Architecture
 
-The pipeline persists execution metadata, schemas, statistical profiles, validation results, and
-bounded problematic-record samples in SQLite. Full datasets are not copied into the history store.
-Benchmark labels remain on an in-memory `BenchmarkGroundTruth` object and never enter incident JSON,
-SQLite evidence, model prompts, or investigation tools.
+The pipeline persists execution metadata, schemas, statistical profiles, validation results,
+bounded problematic-record samples, and synthetic operational records in SQLite. Operational
+records cover supplier submissions, execution logs, orchestration attempts, transformation lineage,
+and configuration changes. Full datasets are not copied into the history store. Benchmark labels
+remain in memory and never enter incident JSON, SQLite, model prompts, or investigation tools.
 
 The LangGraph workflow repeatedly asks the configured model to make one structured decision:
 
@@ -34,12 +37,42 @@ duplicated in the prompt. Successful immutable tools are removed from subsequent
 tools, invalid arguments, repeated tool requests, fabricated evidence references, and unsupported
 diagnosis codes are rejected before they can be treated as successful.
 
-Each model turn includes one compact canonical evidence registry, exact supportable evidence IDs,
-valid failed-check IDs, the completed tool-call ledger, and the remaining informative, empty, and
-invalid-request budgets. The workflow owns hypothesis state while the model emits explicit create,
-update, confirm, or reject operations. Stable hypothesis IDs and cumulative evidence survive across
-turns. A successful conclusion must match a confirmed, evidence-supported hypothesis. Informative,
-empty, and invalid or duplicate results are counted separately, with a total-request safety bound.
+For causal investigations, a separate evidence-sufficiency verifier checks the facts cited for the
+model-selected diagnosis. It does not choose or insert a diagnosis. Each supported mechanism has a
+testable causal signature, such as two matching accepted submissions for a replay, durable writes
+on both a failed attempt and its retry, or timely receipt followed by substantial scheduler queueing.
+Generic validation failures and unrelated operational records cannot confirm a causal hypothesis.
+The verifier reports supporting, contradicting, relevant-but-nondiscriminating, and unavailable
+evidence separately.
+
+Root-cause cases use an `identify_underlying_root_cause` objective. Observable validation failures
+are treated as symptoms, and their diagnosis codes are excluded from the allowed final schema. The
+model must distinguish mechanisms such as two accepted supplier submissions, a retry after a durable
+write, and row multiplication in a join. The deliberately incomplete case can only be completed as
+`insufficient_evidence`.
+
+Each model turn includes one compact canonical evidence registry, exact citable evidence IDs, valid
+failed-check IDs, and an investigation memory. The memory records answered, unavailable, and failed
+questions; normalized tool calls; hypothesis-specific supporting and contradicting evidence; and
+the information still needed. A compact capability catalog explains what each remaining tool can
+answer and what it cannot establish. Tool decisions must name one unanswered causal question, so
+planning remains structured without introducing a long free-text plan.
+
+The workflow owns hypothesis state while the model emits explicit create, update, confirm, or reject
+operations. Stable hypothesis IDs and cumulative evidence survive across turns. Tentative
+hypotheses may exist without proof, but confirmation and a diagnosed conclusion must pass factual
+sufficiency checks. Counterevidence is shown separately and cannot be cited as support. When no
+evidence exists, the causal schema permits only a tool decision while investigation is still
+possible; it cannot emit a diagnosed terminal decision.
+If a diagnosed claim fails factual validation while operational tools remain, the bounded retry is
+constrained to an investigation action instead of allowing the same unsupported conclusion again.
+Hypothesis operations are structurally disabled for that recovery decision, so the current state is
+preserved until the selected tool returns. Exact and semantically equivalent immutable requests are
+rejected before execution. Informative, empty, invalid, and duplicate requests have independent
+limits, plus a total-request safety bound. A causal investigation may return insufficient evidence
+only after the available operational sources have been inspected or established as unavailable.
+Diagnosis taxonomy order varies deterministically by incident so a fixed first enum cannot become a
+cross-case default.
 
 SQLite stores each structured model decision, tool name and arguments, returned evidence, updated
 hypotheses, and final report. Private model reasoning is neither requested nor persisted.
@@ -56,19 +89,22 @@ src/retail_guardian/
   quality.py                Deterministic and statistical validation
   pipeline.py               Ingestion, validation, transformation, and aggregation
   scenarios.py              Healthy and corrupted benchmark scenarios
+  causal_scenarios.py       Opaque causal cases and neutral operational records
   storage.py                Repository protocol, SQLite history, and complete traces
   investigation_models.py   Hypotheses, evidence, telemetry, decisions, and reports
   hypothesis_state.py       Stable hypothesis operations and transition validation
-  investigation_tools.py    Eight incident-bound, read-only investigation tools
+  causal_evidence.py        Fact-level validation of model-selected causal claims
+  investigation_tools.py    Data-quality and operational investigation tools
   providers.py              Mock, Ollama, and OpenAI providers
   investigation.py          Bounded LangGraph investigation workflow
   evaluation.py             Six-scenario evaluation and validation-rule baseline
+  root_cause_evaluation.py  Separate ambiguous causal benchmark and metrics
   cli.py                    Pipeline, investigation, trace, and benchmark commands
 ```
 
 ## Python setup
 
-Python 3.11 or newer is required. The checked-in `uv.lock` provides a reproducible environment:
+Python 3.12 or newer is required. The checked-in `uv.lock` provides a reproducible environment:
 
 ```powershell
 uv sync --extra dev --python 3.12
@@ -144,6 +180,7 @@ retail-guardian investigate `
   --max-tool-calls 8 `
   --max-empty-tool-calls 2 `
   --max-invalid-tool-calls 3 `
+  --max-duplicate-tool-calls 2 `
   --output artifacts\investigation-ollama.json
 ```
 
@@ -154,7 +191,39 @@ with an explicit cause instead of an uncontrolled loop or fabricated diagnosis.
 For credential-free infrastructure tests without a real model, use `--provider mock`. Mock results
 are explicitly labelled `deterministic_mock` and must not be interpreted as LLM performance.
 
-## Run the six-scenario Ollama benchmark
+## Run an upstream root-cause investigation
+
+Generate one opaque case. Case IDs do not encode their hidden causal label:
+
+```powershell
+retail-guardian run-root-cause `
+  --case case-001 `
+  --rows 500 `
+  --seed 42 `
+  --as-of 2026-10-20T12:00:00Z `
+  --database artifacts\root-cause.db `
+  --output-dir artifacts\root-cause
+
+$incident = Get-Content artifacts\root-cause\case-001-incident.json | ConvertFrom-Json
+
+retail-guardian investigate `
+  --database artifacts\root-cause.db `
+  --incident-id $incident.incident_id `
+  --provider ollama `
+  --model qwen3:4b `
+  --timeout 180 `
+  --max-tool-calls 8 `
+  --max-duplicate-tool-calls 2 `
+  --output artifacts\root-cause\investigation.json
+```
+
+The causal fixtures include supplier replays, non-idempotent job retries, incorrect join
+cardinality, source omissions, transformation conversion defects, supplier taxonomy errors,
+approved taxonomy updates with stale runtime configuration, late supplier delivery, scheduler
+backlog, and one case whose audit evidence is deliberately insufficient. Each case also contains
+irrelevant but realistic operational records.
+
+## Run the six-scenario regression benchmark
 
 ```powershell
 retail-guardian benchmark `
@@ -166,6 +235,7 @@ retail-guardian benchmark `
   --max-tool-calls 8 `
   --max-empty-tool-calls 2 `
   --max-invalid-tool-calls 3 `
+  --max-duplicate-tool-calls 2 `
   --rows 500 `
   --seed 42 `
   --database artifacts\benchmark-ollama.db `
@@ -174,7 +244,7 @@ retail-guardian benchmark `
 
 The output identifies itself as `real_local_llm` and records per-case and aggregate:
 
-- root-cause accuracy and evidence support;
+- observable incident-class accuracy and evidence support;
 - workflow completion separately from successful resolution;
 - informative, empty, duplicate, invalid, and total tool calls;
 - tokens, latency, first-attempt schema validity, and retry recovery;
@@ -194,16 +264,48 @@ retail-guardian benchmark --provider mock --rows 500 --seed 42 `
   --output artifacts\evaluation-mock.json
 ```
 
+## Run the root-cause benchmark
+
+The separate ten-case benchmark genuinely requires operational investigation:
+
+```powershell
+retail-guardian root-cause-benchmark `
+  --provider ollama `
+  --model qwen3:4b `
+  --endpoint http://localhost:11434 `
+  --timeout 180 `
+  --model-retries 2 `
+  --max-tool-calls 8 `
+  --max-empty-tool-calls 2 `
+  --max-invalid-tool-calls 3 `
+  --max-duplicate-tool-calls 2 `
+  --rows 500 `
+  --seed 42 `
+  --database artifacts\root-cause-benchmark.db `
+  --output artifacts\root-cause-evaluation.json
+```
+
+It reports root-cause accuracy on resolvable cases, factual evidence support for proposed causes,
+correct inconclusive decisions, false confident conclusions, workflow completion,
+informative/empty/invalid/duplicate tool calls, tokens, and latency. Evidence support is calculated
+from the cited records and their causal relationship to the proposed diagnosis, not from expected
+tool names. The deliberately incomplete case is correct only after the agent establishes that the
+relevant retry and lineage audit data are unavailable. The deterministic mock deliberately returns
+inconclusive for causal cases; it is useful for infrastructure checks, not as a reasoning baseline.
+
 ## Inspect reports and complete traces
 
-The investigation output uses schema version 3.0 and contains the conclusion, final hypothesis
-state, typed evidence results, provider/model names, duration, validation failures, tool-result
-counts, first-attempt schema validity, retry recovery, and termination status:
+The investigation output uses schema version 3.1 and contains the conclusion, final hypothesis
+state, compact investigation questions and statuses, typed evidence results, provider/model names,
+duration, validation failures, tool-result counts, first-attempt schema validity, retry recovery,
+and termination status. Version 3.1 adds `investigation_questions` without removing version 3.0
+fields:
 
 ```powershell
 $result = Get-Content artifacts\investigation-ollama.json | ConvertFrom-Json
 $result.conclusion
 $result.evidence
+$result.investigation_questions
 ```
 
 Read the persisted decision-by-decision trace:
@@ -216,6 +318,8 @@ retail-guardian trace `
 
 The trace includes structured hypothesis operations, approved tool arguments, typed evidence, and
 the final report. It deliberately excludes private reasoning tokens.
+Ollama token totals include every response carrying usage metadata, including structured decisions
+that exhaust their retry budget. A recorded zero is kept distinct from unavailable usage metadata.
 
 Version 3.0 intentionally replaces model-authored full hypothesis snapshots with explicit
 hypothesis operations and adds `result_kind` to evidence. Existing SQLite databases are migrated on
@@ -270,14 +374,19 @@ pytest --cov=retail_guardian --cov-report=term-missing
 Coverage includes successful structured decisions, dynamic evidence and check-ID schemas, stable
 hypothesis transitions, malformed output, actionable retries, fabricated evidence, invalid and empty
 tool results, connection failures, timeouts, missing models, repeated-tool prevention, independent
-budget termination, inconclusive exits, trace persistence, mock investigations, and benchmark
-reporting.
+budget termination, inconclusive exits, operational evidence provenance, competing causal scenarios,
+fact-level sufficiency for every supported causal mechanism, scenario consistency, multi-step
+hypothesis revision, trace persistence, both benchmark suites, and hidden-label isolation.
 
 ## Current scope and limitations
 
 - The generator and contracts model one retail domain and three suppliers.
 - SQLite is suitable for this local MVP, not high-concurrency production workloads.
 - Problematic records are intentionally sampled, so dimension impact is sample-scoped.
+- Operational evidence is synthetic and intentionally compact; it does not model every production
+  logging system or partial-observability failure.
+- Causal sufficiency rules cover the nine benchmark mechanisms. Adding a new supported mechanism
+  requires an explicit, reviewed factual contract in the verifier.
 - Confidence labels express qualitative uncertainty, not calibrated probabilities.
 - Small local models can remain inconsistent despite structured schemas and retries; inconclusive or
   failed reports are valid outcomes.

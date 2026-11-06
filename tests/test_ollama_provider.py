@@ -53,6 +53,9 @@ def _tool_decision(name: str = "inspect_dataset", *, limit: int | None = None) -
     tool_request = {
         "name": name,
         "rationale": "Inspect observed pipeline data",
+        "question_id": f"Q-{name}",
+        "question": f"What evidence can {name} provide?",
+        "hypothesis_ids": [],
     }
     if name == "sample_problematic_records":
         tool_request.update({"check_id": None, "limit": limit})
@@ -200,11 +203,16 @@ def test_ollama_context_summarizes_evidence_and_removes_completed_tools() -> Non
         supplied_context = json.loads(payload["messages"][1]["content"])
         summary = supplied_context["evidence_registry"]["EV-VALIDATION"]
         assert summary["key_findings"]["failed_checks"][0]["affected_rows"] == 5
-        assert supplied_context["supportable_evidence_ids"] == [
+        assert supplied_context["citable_evidence_ids"] == [
             "EV-VALIDATION",
             "EV-CONTRACT",
         ]
-        assert supplied_context["completed_tool_calls"][0]["name"] == ("get_validation_failures")
+        assert supplied_context["investigation_memory"]["used_tool_calls"][0]["name"] == (
+            "get_validation_failures"
+        )
+        capability = supplied_context["tool_capabilities"]["sample_problematic_records"]
+        assert capability["provides"] == "Sample records"
+        assert "arguments" in capability
         assert "evidence" not in supplied_context
         assert "evidence_summary" not in supplied_context
         assert "currency_mismatch" in supplied_context["diagnosis_taxonomy"]
@@ -223,6 +231,317 @@ def test_ollama_context_summarizes_evidence_and_removes_completed_tools() -> Non
         decision = provider.decide(context)
 
     assert decision.tool_request.name == "sample_problematic_records"
+
+
+def test_root_cause_objective_restricts_tools_and_diagnosis_codes() -> None:
+    operational_evidence = Evidence(
+        "EV-SUBMISSION",
+        "get_supplier_submissions",
+        "Retrieved supplier records",
+        {
+            "records": [
+                {
+                    "record_id": "OP-1",
+                    "details": {"field_statistics": {"unit_price": {"null_count": 0}}},
+                }
+            ]
+        },
+    )
+    context = InvestigationContext(
+        incident={
+            "incident_id": "INC-CAUSAL",
+            "violations": [
+                {
+                    "check_id": "unique_order_id",
+                    "severity": "critical",
+                    "finding": {"message": "Order identifiers must be unique"},
+                }
+            ],
+        },
+        hypotheses=[],
+        evidence=[operational_evidence],
+        available_tools=[
+            ToolDefinition("get_supplier_submissions", "Read supplier submission manifests", {})
+        ],
+        remaining_tool_calls=6,
+        available_check_ids=["unique_order_id"],
+        investigation_objective="identify_underlying_root_cause",
+        allowed_diagnosis_codes=[
+            "supplier_batch_replay",
+            "failed_job_retry",
+            "incorrect_join_cardinality",
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        supplied_context = json.loads(payload["messages"][1]["content"])
+        schema_text = json.dumps(payload["format"])
+        assert supplied_context["investigation_objective"] == ("identify_underlying_root_cause")
+        assert set(supplied_context["diagnosis_taxonomy"]) == {
+            "supplier_batch_replay",
+            "failed_job_retry",
+            "incorrect_join_cardinality",
+        }
+        assert (
+            supplied_context["evidence_registry"]["EV-SUBMISSION"]["key_findings"]["records"][0][
+                "details"
+            ]["field_statistics"]["unit_price"]["null_count"]
+            == 0
+        )
+        assert "supplier_batch_replay" in schema_text
+        assert "missing_values" not in schema_text
+        return httpx.Response(
+            200,
+            json=_ollama_response(_tool_decision("get_supplier_submissions")),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=0)
+        decision = provider.decide(context)
+
+    assert decision.tool_request.name == "get_supplier_submissions"
+
+
+def test_initial_causal_schema_allows_hypotheses_but_not_diagnosed_conclusions() -> None:
+    context = InvestigationContext(
+        incident={"incident_id": "INC-CAUSAL", "violations": []},
+        hypotheses=[],
+        evidence=[],
+        available_tools=[ToolDefinition("get_supplier_submissions", "Read supplier manifests", {})],
+        remaining_tool_calls=4,
+        investigation_objective="identify_underlying_root_cause",
+        allowed_diagnosis_codes=[
+            "supplier_batch_replay",
+            "failed_job_retry",
+            "incorrect_join_cardinality",
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        schema = json.loads(request.content)["format"]
+        actions = [item["properties"]["action"]["const"] for item in schema["oneOf"]]
+        operation_codes = schema["$defs"]["_HypothesisOperationPayload"]["properties"][
+            "diagnosis_code"
+        ]["anyOf"]
+        assert actions == ["tool"]
+        assert any(item.get("enum") == context.allowed_diagnosis_codes for item in operation_codes)
+        decision = _tool_decision("get_supplier_submissions")
+        decision["hypothesis_operations"][0]["diagnosis_code"] = "failed_job_retry"
+        return httpx.Response(200, json=_ollama_response(decision))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=0)
+        decision = provider.decide(context)
+
+    assert decision.action == "tool"
+    assert decision.hypothesis_operations[0].diagnosis_code == "failed_job_retry"
+
+
+def test_causal_confirmation_retries_when_cited_facts_do_not_support_claim() -> None:
+    evidence = Evidence(
+        "EV-SUBMISSION",
+        "get_supplier_submissions",
+        "Retrieved one supplier submission",
+        {
+            "records": [
+                {
+                    "record_id": "OP-1",
+                    "occurred_at": "2026-10-20T11:20:00+00:00",
+                    "details": {
+                        "supplier_id": "atlas_us",
+                        "batch_id": "batch-1",
+                        "checksum": "checksum-1",
+                        "status": "accepted",
+                    },
+                }
+            ],
+            "coverage": {"complete": True, "record_count": 1},
+        },
+    )
+    context = InvestigationContext(
+        incident={"incident_id": "INC-CAUSAL", "violations": []},
+        hypotheses=[
+            RootCauseHypothesis(
+                "H-replay",
+                "The supplier batch may have been replayed",
+                "supplier_batch_replay",
+            )
+        ],
+        evidence=[evidence],
+        available_tools=[
+            ToolDefinition("get_orchestration_events", "Read orchestration history", {})
+        ],
+        remaining_tool_calls=3,
+        investigation_objective="identify_underlying_root_cause",
+        allowed_diagnosis_codes=["supplier_batch_replay", "failed_job_retry"],
+    )
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        payload = json.loads(request.content)
+        if attempts == 1:
+            memory = json.loads(payload["messages"][1]["content"])["investigation_memory"]
+            replay_check = memory["hypothesis_checks"][0]
+            assert replay_check["hypothesis_id"] == "H-replay"
+            assert replay_check["contradicting_evidence"] == ["EV-SUBMISSION"]
+            assert replay_check["information_needed"]
+            assert memory["unexplored_tools"] == ["get_orchestration_events"]
+            decision = {
+                "action": "conclude",
+                "hypothesis_operations": [
+                    {
+                        "operation": "confirm",
+                        "hypothesis_id": "H-replay",
+                        "statement": None,
+                        "diagnosis_code": "supplier_batch_replay",
+                        "supporting_evidence": ["EV-SUBMISSION"],
+                        "contradicting_evidence": [],
+                    }
+                ],
+                "tool_request": None,
+                "conclusion": {
+                    "diagnosis_code": "supplier_batch_replay",
+                    "final_diagnosis": "The supplier replayed a batch",
+                    "confidence": "high",
+                    "evidence_references": ["EV-SUBMISSION"],
+                    "outstanding_questions": [],
+                    "recommended_actions": [],
+                },
+            }
+        else:
+            correction = payload["messages"][-1]["content"]
+            assert "rejected and was not applied" in correction
+            assert "Hypothesis IDs currently in state: H-replay" in correction
+            assert "Available evidence IDs: EV-SUBMISSION" in correction
+            assert "get_orchestration_events" in correction
+            actions = [item["properties"]["action"]["const"] for item in payload["format"]["oneOf"]]
+            assert actions == ["tool"]
+            recovery_operations = payload["format"]["oneOf"][0]["properties"][
+                "hypothesis_operations"
+            ]
+            assert recovery_operations["maxItems"] == 0
+            assert "Causal recovery mode is active" in correction
+            assert "hypothesis_operations: []" in correction
+            if attempts == 2:
+                assert "at least two accepted submissions" in correction
+            else:
+                assert "invalid structured decision" in correction.lower()
+            decision = {
+                "action": "tool",
+                "hypothesis_operations": [],
+                "tool_request": {
+                    "name": "get_orchestration_events",
+                    "rationale": "Test the competing retry explanation",
+                    "question_id": "Q-orchestration",
+                    "question": "Did orchestration retry the execution?",
+                    "hypothesis_ids": ["H-replay"],
+                },
+                "conclusion": None,
+            }
+            if attempts == 2:
+                decision["tool_request"]["query"] = "select *"
+        return httpx.Response(200, json=_ollama_response(decision))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=2)
+        decision = provider.decide(context)
+
+    assert decision.action == "tool"
+    assert decision.tool_request.name == "get_orchestration_events"
+    assert provider.telemetry.validation_failures == 2
+    assert provider.telemetry.invalid_tool_calls == 1
+    assert provider.telemetry.retry_recoveries == 1
+    assert "causal evidence is insufficient" in provider.telemetry.rejected_decisions[0].error
+
+
+def test_causal_inconclusive_requires_exhausting_operational_sources() -> None:
+    evidence = Evidence(
+        "EV-SUBMISSION",
+        "get_supplier_submissions",
+        "Retrieved one supplier submission",
+        {"records": [], "coverage": {"complete": True}},
+    )
+    decision = {
+        "action": "conclude",
+        "hypothesis_operations": [],
+        "tool_request": None,
+        "conclusion": {
+            "diagnosis_code": None,
+            "final_diagnosis": "The available evidence is insufficient",
+            "confidence": "insufficient_evidence",
+            "evidence_references": ["EV-SUBMISSION"],
+            "outstanding_questions": [],
+            "recommended_actions": [],
+        },
+    }
+    context = InvestigationContext(
+        incident={"incident_id": "INC-CAUSAL"},
+        hypotheses=[],
+        evidence=[evidence],
+        available_tools=[
+            ToolDefinition("get_orchestration_events", "Read orchestration history", {})
+        ],
+        remaining_tool_calls=3,
+        investigation_objective="identify_underlying_root_cause",
+        allowed_diagnosis_codes=["supplier_batch_replay", "failed_job_retry"],
+    )
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=_ollama_response(decision)))
+
+    with httpx.Client(transport=transport) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=0)
+        with pytest.raises(ModelOutputValidationError, match="remain unexplored"):
+            provider.decide(context)
+
+
+def test_causal_inconclusive_accepts_explicitly_unavailable_exhausted_evidence() -> None:
+    evidence = Evidence(
+        "EV-ORCHESTRATION",
+        "get_orchestration_events",
+        "Retrieved unavailable orchestration metadata",
+        {
+            "records": [
+                {
+                    "details": {
+                        "state": "metadata_unavailable",
+                        "reason": "retention_window_expired",
+                    }
+                }
+            ]
+        },
+    )
+    decision = {
+        "action": "conclude",
+        "hypothesis_operations": [],
+        "tool_request": None,
+        "conclusion": {
+            "diagnosis_code": None,
+            "final_diagnosis": "Operational evidence is unavailable",
+            "confidence": "insufficient_evidence",
+            "evidence_references": ["EV-ORCHESTRATION"],
+            "outstanding_questions": [],
+            "recommended_actions": [],
+        },
+    }
+    context = InvestigationContext(
+        incident={"incident_id": "INC-CAUSAL"},
+        hypotheses=[],
+        evidence=[evidence],
+        available_tools=[ToolDefinition("get_validation_failures", "Read failures", {})],
+        remaining_tool_calls=3,
+        investigation_objective="identify_underlying_root_cause",
+        allowed_diagnosis_codes=["supplier_batch_replay", "failed_job_retry"],
+    )
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=_ollama_response(decision)))
+
+    with httpx.Client(transport=transport) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=0)
+        result = provider.decide(context)
+
+    assert result.action == "conclude"
+    assert result.conclusion.confidence.value == "insufficient_evidence"
 
 
 def test_completed_tool_selection_gets_specific_correction() -> None:
@@ -294,6 +613,53 @@ def test_malformed_output_is_retried_and_state_is_preserved() -> None:
     assert provider.telemetry.first_attempt_schema_valid_decisions == 0
     assert provider.telemetry.calls == 2
     assert provider.telemetry.rejected_decisions[0].decision is None
+
+
+def test_exhausted_retries_preserve_all_available_token_usage() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "message": {"content": "not JSON"},
+                "prompt_eval_count": 11,
+                "eval_count": 7,
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=2)
+        with pytest.raises(ModelOutputValidationError, match="invalid structured decision"):
+            provider.decide(_context())
+
+    assert provider.telemetry.calls == 3
+    assert provider.telemetry.validation_failures == 3
+    assert provider.telemetry.token_usage_available
+    assert provider.telemetry.token_usage == 54
+
+
+@pytest.mark.parametrize(
+    ("response_payload", "usage_available"),
+    [
+        (
+            {
+                "message": {"content": "not JSON"},
+                "prompt_eval_count": 0,
+                "eval_count": 0,
+            },
+            True,
+        ),
+        ({"message": {"content": "not JSON"}}, False),
+    ],
+)
+def test_token_usage_distinguishes_zero_from_unavailable(response_payload, usage_available) -> None:
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=response_payload))
+    with httpx.Client(transport=transport) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=0)
+        with pytest.raises(ModelOutputValidationError):
+            provider.decide(_context())
+
+    assert provider.telemetry.token_usage == 0
+    assert provider.telemetry.token_usage_available is usage_available
 
 
 def test_tentative_hypothesis_with_fabricated_evidence_is_corrected() -> None:
