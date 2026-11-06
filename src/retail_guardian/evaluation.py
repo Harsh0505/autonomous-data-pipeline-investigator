@@ -21,11 +21,19 @@ class EvaluationCase:
     tool_calls: int
     token_usage: int | None
     completed: bool
+    workflow_completed: bool
+    resolved: bool
     baseline_prediction: str | None
     baseline_correct: bool
     status: str
     duration_seconds: float
     invalid_tool_calls: int
+    informative_tool_calls: int
+    empty_tool_calls: int
+    duplicate_tool_calls: int
+    decision_count: int
+    first_attempt_schema_valid_decisions: int
+    retry_recoveries: int
     model_validation_failures: int
     investigation_failures: int
     timeouts: int
@@ -39,17 +47,26 @@ class EvaluationSummary:
     accuracy: float
     evidence_support_rate: float
     completion_rate: float
+    workflow_completion_rate: float
+    resolution_rate: float
     average_tool_calls: float
     total_tokens: int | None
     baseline_accuracy: float
     average_duration_seconds: float
     invalid_tool_calls: int
+    informative_tool_calls: int
+    empty_tool_calls: int
+    duplicate_tool_calls: int
+    first_attempt_schema_validity_rate: float
+    retry_recoveries: int
     model_validation_failures: int
     investigation_failures: int
     timeouts: int
     evaluation_type: str
     provider_name: str
     model_name: str
+    benchmark_scope: str
+    benchmark_disclaimer: str
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -108,13 +125,17 @@ class BenchmarkEvaluator:
         report = self.agent_factory().investigate(run.report.incident_id)
         expected = truth.failure_types[0].value
         predicted = report.conclusion.diagnosis_code
-        valid_evidence = {item.evidence_id for item in report.evidence if item.success}
+        valid_evidence = {
+            item.evidence_id for item in report.evidence if item.result_kind.value == "informative"
+        }
         evidence_supported = (
             predicted == expected
             and bool(report.conclusion.evidence_references)
             and set(report.conclusion.evidence_references).issubset(valid_evidence)
         )
         baseline = validation_baseline(run)
+        workflow_completed = report.status in {"completed", "inconclusive"}
+        resolved = report.status == "completed" and predicted is not None
         return EvaluationCase(
             incident_id=run.report.incident_id,
             expected_root_cause=expected,
@@ -123,12 +144,20 @@ class BenchmarkEvaluator:
             evidence_supported=evidence_supported,
             tool_calls=report.tool_call_count,
             token_usage=report.token_usage,
-            completed=report.status in {"completed", "inconclusive"},
+            completed=workflow_completed,
+            workflow_completed=workflow_completed,
+            resolved=resolved,
             baseline_prediction=baseline,
             baseline_correct=baseline == expected,
             status=report.status,
             duration_seconds=report.duration_seconds,
             invalid_tool_calls=report.invalid_tool_calls,
+            informative_tool_calls=report.informative_tool_calls,
+            empty_tool_calls=report.empty_tool_calls,
+            duplicate_tool_calls=report.duplicate_tool_calls,
+            decision_count=report.decision_count,
+            first_attempt_schema_valid_decisions=report.first_attempt_schema_valid_decisions,
+            retry_recoveries=report.retry_recoveries,
             model_validation_failures=report.model_validation_failures,
             investigation_failures=report.investigation_failures,
             timeouts=report.timeouts,
@@ -169,20 +198,37 @@ def _summarize(cases: list[EvaluationCase]) -> EvaluationSummary:
         "ollama": "real_local_llm",
         "openai": "external_llm",
     }.get(provider_name, "unknown")
+    decision_count = sum(case.decision_count for case in cases)
     return EvaluationSummary(
         cases=cases,
         accuracy=sum(case.correct for case in cases) / count,
         evidence_support_rate=sum(case.evidence_supported for case in cases) / count,
         completion_rate=sum(case.completed for case in cases) / count,
+        workflow_completion_rate=sum(case.workflow_completed for case in cases) / count,
+        resolution_rate=sum(case.resolved for case in cases) / count,
         average_tool_calls=sum(case.tool_calls for case in cases) / count,
         total_tokens=sum(tokens) if tokens else None,
         baseline_accuracy=sum(case.baseline_correct for case in cases) / count,
         average_duration_seconds=sum(case.duration_seconds for case in cases) / count,
         invalid_tool_calls=sum(case.invalid_tool_calls for case in cases),
+        informative_tool_calls=sum(case.informative_tool_calls for case in cases),
+        empty_tool_calls=sum(case.empty_tool_calls for case in cases),
+        duplicate_tool_calls=sum(case.duplicate_tool_calls for case in cases),
+        first_attempt_schema_validity_rate=(
+            sum(case.first_attempt_schema_valid_decisions for case in cases) / decision_count
+            if decision_count
+            else 0.0
+        ),
+        retry_recoveries=sum(case.retry_recoveries for case in cases),
         model_validation_failures=sum(case.model_validation_failures for case in cases),
         investigation_failures=sum(case.investigation_failures for case in cases),
         timeouts=sum(case.timeouts for case in cases),
         evaluation_type=evaluation_type,
         provider_name=provider_name,
         model_name=model_name,
+        benchmark_scope="deterministic_incident_regression",
+        benchmark_disclaimer=(
+            "This suite measures workflow reliability on known deterministic incident classes; "
+            "it does not measure ambiguous upstream root-cause investigation."
+        ),
     )

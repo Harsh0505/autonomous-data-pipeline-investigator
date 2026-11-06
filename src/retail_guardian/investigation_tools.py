@@ -6,7 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from retail_guardian.config import PipelineConfig
-from retail_guardian.investigation_models import Evidence, ToolDefinition
+from retail_guardian.investigation_models import Evidence, ToolDefinition, ToolResultKind
 from retail_guardian.storage import HistoryRepository
 
 
@@ -40,6 +40,11 @@ class InvestigationToolbox:
 
     @property
     def definitions(self) -> list[ToolDefinition]:
+        check_id_parameter = {
+            "type": "string",
+            "required": False,
+            "enum": self.available_check_ids,
+        }
         return [
             ToolDefinition(
                 "inspect_dataset",
@@ -65,7 +70,7 @@ class InvestigationToolbox:
                 "sample_problematic_records",
                 "Inspect a bounded sample of records implicated by a validation check.",
                 {
-                    "check_id": {"type": "string", "required": False},
+                    "check_id": check_id_parameter,
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
             ),
@@ -77,7 +82,7 @@ class InvestigationToolbox:
             ToolDefinition(
                 "identify_affected_dimensions",
                 "Summarize suppliers and categories present in sampled problematic records.",
-                {"check_id": {"type": "string", "required": False}},
+                {"check_id": check_id_parameter},
             ),
             ToolDefinition(
                 "get_data_contract",
@@ -85,6 +90,25 @@ class InvestigationToolbox:
                 {},
             ),
         ]
+
+    @property
+    def available_check_ids(self) -> list[str]:
+        return sorted(
+            result["check_id"]
+            for result in self.repository.get_validation_results(self.execution_id)
+            if not result["passed"]
+        )
+
+    @property
+    def non_repeatable_tools(self) -> set[str]:
+        """Tools whose incident-scoped result cannot change during an investigation."""
+        return {
+            "inspect_dataset",
+            "get_validation_failures",
+            "compare_schemas",
+            "compare_distributions",
+            "get_data_contract",
+        }
 
     def execute(self, name: str, arguments: dict[str, Any] | None = None) -> Evidence:
         evidence_id = f"EV-{uuid4().hex[:12].upper()}"
@@ -98,6 +122,7 @@ class InvestigationToolbox:
                 data={},
                 success=False,
                 error=validation_error,
+                result_kind=ToolResultKind.INVALID,
             )
         try:
             summary, data = self._tools[name](arguments)
@@ -109,8 +134,15 @@ class InvestigationToolbox:
                 data={},
                 success=False,
                 error=str(exc),
+                result_kind=ToolResultKind.INVALID,
             )
-        return Evidence(evidence_id, name, summary, data)
+        return Evidence(
+            evidence_id,
+            name,
+            summary,
+            data,
+            result_kind=_classify_result(name, data),
+        )
 
     def validate_request(self, name: str, arguments: dict[str, Any]) -> str | None:
         definitions = {item.name: item for item in self.definitions}
@@ -131,6 +163,12 @@ class InvestigationToolbox:
                     return f"{argument_name} exceeds the allowed maximum"
             if specification.get("type") == "string" and not isinstance(value, str):
                 return f"{argument_name} must be a string"
+            allowed_values = specification.get("enum")
+            if allowed_values is not None and value not in allowed_values:
+                return (
+                    f"{argument_name} must be one of the available values: "
+                    f"{allowed_values or ['none']}"
+                )
         return None
 
     def _inspect_dataset(self, _: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -221,9 +259,14 @@ class InvestigationToolbox:
 
     def _get_pipeline_history(self, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         limit = _bounded_limit(arguments.get("limit", 10), maximum=20)
-        history = self.repository.list_executions(
-            before_ingested_at=str(self.execution["ingestion_timestamp"]), limit=limit
+        candidates = self.repository.list_executions(
+            before_ingested_at=str(self.execution["ingestion_timestamp"]), limit=100
         )
+        history = [
+            _execution_summary(item)
+            for item in candidates
+            if item["status"] == "healthy" and item["source"] == self.execution["source"]
+        ][:limit]
         return f"Retrieved {len(history)} prior pipeline execution(s)", {
             "executions": history,
             "sufficient_history": bool(history),
@@ -263,8 +306,14 @@ class InvestigationToolbox:
         history = self.repository.list_executions(
             before_ingested_at=str(self.execution["ingestion_timestamp"]), limit=20
         )
-        healthy = next((item for item in history if item["status"] == "healthy"), None)
-        return healthy or (history[0] if history else None)
+        return next(
+            (
+                item
+                for item in history
+                if item["status"] == "healthy" and item["source"] == self.execution["source"]
+            ),
+            None,
+        )
 
 
 def _numeric_changes(current: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
@@ -319,3 +368,36 @@ def _optional_string(value: Any) -> str | None:
     if not isinstance(value, str):
         raise TypeError("check_id must be a string")
     return value
+
+
+def _classify_result(name: str, data: dict[str, Any]) -> ToolResultKind:
+    if name == "get_validation_failures" and not data.get("failures"):
+        return ToolResultKind.EMPTY
+    if name == "sample_problematic_records" and not data.get("samples"):
+        return ToolResultKind.EMPTY
+    if name == "identify_affected_dimensions" and data.get("sample_count", 0) == 0:
+        return ToolResultKind.EMPTY
+    if name == "get_pipeline_history" and not data.get("executions"):
+        return ToolResultKind.EMPTY
+    if name in {"compare_schemas", "compare_distributions"} and not data.get(
+        "sufficient_history", False
+    ):
+        return ToolResultKind.EMPTY
+    return ToolResultKind.INFORMATIVE
+
+
+def _execution_summary(execution: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: execution[key]
+        for key in (
+            "execution_id",
+            "incident_id",
+            "source",
+            "status",
+            "pipeline_stage",
+            "ingestion_timestamp",
+            "event_time_min",
+            "event_time_max",
+            "row_count",
+        )
+    }

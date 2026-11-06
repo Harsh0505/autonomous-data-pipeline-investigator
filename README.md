@@ -1,9 +1,9 @@
-# Retail Pipeline Guardian — Day 2.5
+# Retail Pipeline Guardian — Investigation reliability hardening
 
 Retail Pipeline Guardian detects failures in synthetic multi-supplier retail feeds and investigates
-incidents through a bounded, evidence-driven LangGraph workflow. Day 2.5 adds real local inference
+incidents through a bounded, evidence-driven LangGraph workflow. It supports real local inference
 through Ollama while preserving the deterministic test provider and optional OpenAI provider.
-Autonomous repair, FastAPI, and the frontend remain out of scope.
+Autonomous repair, FastAPI, the frontend, and an ambiguous root-cause benchmark remain out of scope.
 
 The project can run real autonomous investigations locally without API credentials or paid services.
 
@@ -27,10 +27,19 @@ observable incident + current evidence
                  +------> conclude with real evidence IDs
 ```
 
-Every provider returns the same typed `ModelDecision`. Ollama receives its JSON Schema directly,
+Every provider returns the same typed `ModelDecision`. Ollama receives a state-specific JSON Schema,
 uses deterministic generation settings, and has bounded retries for malformed output, connection
-failures, and timeouts. Unknown tools, invalid arguments, repeated tool requests, fabricated evidence
-references, and unsupported diagnosis codes are rejected before they can be treated as successful.
+failures, and timeouts. The schema is supplied through Ollama's `format` parameter rather than being
+duplicated in the prompt. Successful immutable tools are removed from subsequent schemas. Unknown
+tools, invalid arguments, repeated tool requests, fabricated evidence references, and unsupported
+diagnosis codes are rejected before they can be treated as successful.
+
+Each model turn includes one compact canonical evidence registry, exact supportable evidence IDs,
+valid failed-check IDs, the completed tool-call ledger, and the remaining informative, empty, and
+invalid-request budgets. The workflow owns hypothesis state while the model emits explicit create,
+update, confirm, or reject operations. Stable hypothesis IDs and cumulative evidence survive across
+turns. A successful conclusion must match a confirmed, evidence-supported hypothesis. Informative,
+empty, and invalid or duplicate results are counted separately, with a total-request safety bound.
 
 SQLite stores each structured model decision, tool name and arguments, returned evidence, updated
 hypotheses, and final report. Private model reasoning is neither requested nor persisted.
@@ -49,6 +58,7 @@ src/retail_guardian/
   scenarios.py              Healthy and corrupted benchmark scenarios
   storage.py                Repository protocol, SQLite history, and complete traces
   investigation_models.py   Hypotheses, evidence, telemetry, decisions, and reports
+  hypothesis_state.py       Stable hypothesis operations and transition validation
   investigation_tools.py    Eight incident-bound, read-only investigation tools
   providers.py              Mock, Ollama, and OpenAI providers
   investigation.py          Bounded LangGraph investigation workflow
@@ -132,6 +142,8 @@ retail-guardian investigate `
   --timeout 120 `
   --model-retries 2 `
   --max-tool-calls 8 `
+  --max-empty-tool-calls 2 `
+  --max-invalid-tool-calls 3 `
   --output artifacts\investigation-ollama.json
 ```
 
@@ -152,6 +164,8 @@ retail-guardian benchmark `
   --timeout 180 `
   --model-retries 2 `
   --max-tool-calls 8 `
+  --max-empty-tool-calls 2 `
+  --max-invalid-tool-calls 3 `
   --rows 500 `
   --seed 42 `
   --database artifacts\benchmark-ollama.db `
@@ -161,11 +175,16 @@ retail-guardian benchmark `
 The output identifies itself as `real_local_llm` and records per-case and aggregate:
 
 - root-cause accuracy and evidence support;
-- completion status and total duration;
-- tool and token counts;
-- invalid tool calls and structured-output validation failures;
+- workflow completion separately from successful resolution;
+- informative, empty, duplicate, invalid, and total tool calls;
+- tokens, latency, first-attempt schema validity, and retry recovery;
+- structured-output validation failures;
 - investigation failures and timeouts;
 - the simple non-agent validation baseline.
+
+This six-scenario suite is a deterministic incident-class regression benchmark. Its labels can be
+derived directly from validation identifiers, so it does not measure ambiguous upstream root-cause
+reasoning. Reports include this limitation explicitly.
 
 Run the deterministic comparison separately:
 
@@ -177,8 +196,9 @@ retail-guardian benchmark --provider mock --rows 500 --seed 42 `
 
 ## Inspect reports and complete traces
 
-The investigation output contains the conclusion, hypotheses, cited evidence, provider/model names,
-duration, validation failures, invalid calls, and termination status:
+The investigation output uses schema version 3.0 and contains the conclusion, final hypothesis
+state, typed evidence results, provider/model names, duration, validation failures, tool-result
+counts, first-attempt schema validity, retry recovery, and termination status:
 
 ```powershell
 $result = Get-Content artifacts\investigation-ollama.json | ConvertFrom-Json
@@ -194,8 +214,13 @@ retail-guardian trace `
   --investigation-id $result.investigation_id
 ```
 
-The trace includes structured decisions and hypothesis updates, approved tool arguments, returned
-evidence, and the final report. It deliberately excludes private reasoning tokens.
+The trace includes structured hypothesis operations, approved tool arguments, typed evidence, and
+the final report. It deliberately excludes private reasoning tokens.
+
+Version 3.0 intentionally replaces model-authored full hypothesis snapshots with explicit
+hypothesis operations and adds `result_kind` to evidence. Existing SQLite databases are migrated on
+open. Legacy custom providers that still return complete hypothesis snapshots remain supported and
+their entries are merged by hypothesis ID rather than replacing workflow state.
 
 ## RX 6600 XT and performance troubleshooting
 
@@ -242,10 +267,11 @@ ruff format --check .
 pytest --cov=retail_guardian --cov-report=term-missing
 ```
 
-Coverage includes successful structured decisions, dynamic tool selection, malformed output,
-invalid tools and arguments, fabricated evidence, connection failures, timeouts, missing models,
-retry exhaustion, duplicate tool prevention, budget termination, trace persistence, the original
-mock investigations, and benchmark reporting.
+Coverage includes successful structured decisions, dynamic evidence and check-ID schemas, stable
+hypothesis transitions, malformed output, actionable retries, fabricated evidence, invalid and empty
+tool results, connection failures, timeouts, missing models, repeated-tool prevention, independent
+budget termination, inconclusive exits, trace persistence, mock investigations, and benchmark
+reporting.
 
 ## Current scope and limitations
 

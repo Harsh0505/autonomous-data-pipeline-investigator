@@ -6,8 +6,10 @@ import httpx
 import pytest
 
 from retail_guardian.investigation_models import (
+    CompletedToolCall,
     Evidence,
     InvestigationContext,
+    RootCauseHypothesis,
     ToolDefinition,
 )
 from retail_guardian.providers import (
@@ -19,10 +21,13 @@ from retail_guardian.providers import (
 )
 
 
-def _context(evidence: list[Evidence] | None = None) -> InvestigationContext:
+def _context(
+    evidence: list[Evidence] | None = None,
+    hypotheses: list[RootCauseHypothesis] | None = None,
+) -> InvestigationContext:
     return InvestigationContext(
         incident={"incident_id": "INC-TEST", "violations": []},
-        hypotheses=[],
+        hypotheses=hypotheses or [],
         evidence=evidence or [],
         available_tools=[
             ToolDefinition("inspect_dataset", "Inspect data", {}),
@@ -30,12 +35,17 @@ def _context(evidence: list[Evidence] | None = None) -> InvestigationContext:
                 "sample_problematic_records",
                 "Sample records",
                 {
-                    "check_id": {"type": "string", "required": False},
+                    "check_id": {
+                        "type": "string",
+                        "required": False,
+                        "enum": ["schema_contract"],
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
             ),
         ],
         remaining_tool_calls=4,
+        available_check_ids=["schema_contract"],
     )
 
 
@@ -52,12 +62,12 @@ def _tool_decision(name: str = "inspect_dataset", *, limit: int | None = None) -
         tool_request["check_id"] = None
     return {
         "action": "tool",
-        "hypotheses": [
+        "hypothesis_operations": [
             {
+                "operation": "create",
                 "hypothesis_id": "H-1",
                 "statement": "More evidence is needed",
                 "diagnosis_code": None,
-                "status": "active",
                 "supporting_evidence": [],
                 "contradicting_evidence": [],
             }
@@ -70,12 +80,12 @@ def _tool_decision(name: str = "inspect_dataset", *, limit: int | None = None) -
 def _conclusion(evidence_id: str) -> dict:
     return {
         "action": "conclude",
-        "hypotheses": [
+        "hypothesis_operations": [
             {
+                "operation": "confirm",
                 "hypothesis_id": "H-1",
                 "statement": "The upstream schema changed",
                 "diagnosis_code": "schema_change",
-                "status": "confirmed",
                 "supporting_evidence": [evidence_id],
                 "contradicting_evidence": [],
             }
@@ -109,7 +119,13 @@ def test_ollama_returns_structured_tool_decision() -> None:
         assert payload["model"] == "qwen3:4b"
         assert payload["stream"] is False
         assert payload["think"] is False
+        assert "Decision JSON Schema" not in payload["messages"][0]["content"]
         assert payload["format"]["type"] == "object"
+        action_schemas = {
+            item["properties"]["action"]["const"]: item for item in payload["format"]["oneOf"]
+        }
+        assert action_schemas["tool"]["properties"]["conclusion"] == {"type": "null"}
+        assert action_schemas["conclude"]["properties"]["tool_request"] == {"type": "null"}
         context = json.loads(payload["messages"][1]["content"])
         assert context["available_evidence_ids"] == []
         return httpx.Response(200, json=_ollama_response(_tool_decision()))
@@ -123,6 +139,123 @@ def test_ollama_returns_structured_tool_decision() -> None:
     assert decision.token_usage == 20
     assert provider.telemetry.calls == 1
     assert provider.telemetry.provider_name == "ollama"
+    assert provider.telemetry.first_attempt_schema_valid_decisions == 1
+
+
+def test_ollama_context_summarizes_evidence_and_removes_completed_tools() -> None:
+    evidence = Evidence(
+        "EV-VALIDATION",
+        "get_validation_failures",
+        "Retrieved 1 validation failure(s)",
+        {
+            "failures": [
+                {
+                    "check_id": "supplier_currency",
+                    "kind": "deterministic",
+                    "severity": "critical",
+                    "finding": {
+                        "message": "Supplier currency differs from its contract",
+                        "affected_rows": 5,
+                        "sample_values": [{"supplier_id": "meridian_uk", "currency": "USD"}],
+                        "context": {},
+                    },
+                }
+            ]
+        },
+    )
+    contract_evidence = Evidence(
+        "EV-CONTRACT",
+        "get_data_contract",
+        "Retrieved configured contracts",
+        {
+            "supplier_currencies": {"meridian_uk": "GBP"},
+            "unit_price_z_score_threshold": 5.0,
+        },
+    )
+    context = InvestigationContext(
+        incident={"incident_id": "INC-TEST"},
+        hypotheses=[],
+        evidence=[evidence, contract_evidence],
+        available_tools=[
+            ToolDefinition(
+                "sample_problematic_records",
+                "Sample records",
+                {
+                    "check_id": {"type": "string", "required": False},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+            )
+        ],
+        remaining_tool_calls=3,
+        completed_tool_calls=[
+            CompletedToolCall("get_validation_failures", {}, "EV-VALIDATION", True),
+            CompletedToolCall("get_data_contract", {}, "EV-CONTRACT", True),
+        ],
+        remaining_invalid_tool_calls=2,
+        available_check_ids=["supplier_currency"],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        supplied_context = json.loads(payload["messages"][1]["content"])
+        summary = supplied_context["evidence_registry"]["EV-VALIDATION"]
+        assert summary["key_findings"]["failed_checks"][0]["affected_rows"] == 5
+        assert supplied_context["supportable_evidence_ids"] == [
+            "EV-VALIDATION",
+            "EV-CONTRACT",
+        ]
+        assert supplied_context["completed_tool_calls"][0]["name"] == ("get_validation_failures")
+        assert "evidence" not in supplied_context
+        assert "evidence_summary" not in supplied_context
+        assert "currency_mismatch" in supplied_context["diagnosis_taxonomy"]
+        assert supplied_context["remaining_invalid_tool_calls"] == 2
+        schema_text = json.dumps(payload["format"])
+        assert "get_validation_failures" not in schema_text
+        assert "EV-VALIDATION" in schema_text
+        assert "supplier_currency" in schema_text
+        return httpx.Response(
+            200,
+            json=_ollama_response(_tool_decision("sample_problematic_records", limit=5)),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=0)
+        decision = provider.decide(context)
+
+    assert decision.tool_request.name == "sample_problematic_records"
+
+
+def test_completed_tool_selection_gets_specific_correction() -> None:
+    evidence = Evidence("EV-REAL", "inspect_dataset", "Observed dataset", {})
+    context = InvestigationContext(
+        incident={"incident_id": "INC-TEST"},
+        hypotheses=[],
+        evidence=[evidence],
+        available_tools=[ToolDefinition("get_data_contract", "Get contract", {})],
+        remaining_tool_calls=3,
+        completed_tool_calls=[CompletedToolCall("inspect_dataset", {}, "EV-REAL", True)],
+    )
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            decision = _tool_decision("inspect_dataset")
+        else:
+            correction = json.loads(request.content)["messages"][-1]["content"]
+            assert "not currently available" in correction
+            assert "Completed successful tools: inspect_dataset" in correction
+            assert "Currently available tools: get_data_contract" in correction
+            decision = _tool_decision("get_data_contract")
+        return httpx.Response(200, json=_ollama_response(decision))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=1)
+        decision = provider.decide(context)
+
+    assert decision.tool_request.name == "get_data_contract"
+    assert provider.telemetry.invalid_tool_calls == 1
 
 
 def test_ollama_configuration_uses_environment(monkeypatch) -> None:
@@ -157,6 +290,8 @@ def test_malformed_output_is_retried_and_state_is_preserved() -> None:
     assert decision.action == "tool"
     assert provider.telemetry.validation_failures == 1
     assert provider.telemetry.retries == 1
+    assert provider.telemetry.retry_recoveries == 1
+    assert provider.telemetry.first_attempt_schema_valid_decisions == 0
     assert provider.telemetry.calls == 2
     assert provider.telemetry.rejected_decisions[0].decision is None
 
@@ -169,12 +304,12 @@ def test_tentative_hypothesis_with_fabricated_evidence_is_corrected() -> None:
         attempts += 1
         decision = _tool_decision()
         if attempts == 1:
-            decision["hypotheses"][0]["supporting_evidence"] = ["EV-NOT-YET-CREATED"]
+            decision["hypothesis_operations"][0]["supporting_evidence"] = ["EV-NOT-YET-CREATED"]
         else:
             correction = json.loads(request.content)["messages"][-1]["content"]
             assert "EV-NOT-YET-CREATED" in correction
             assert "Available evidence IDs: none" in correction
-            assert "tentative active hypothesis may use empty evidence arrays" in correction
+            assert "Evidence arrays accept bare IDs only" in correction
         return httpx.Response(200, json=_ollama_response(decision))
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
@@ -182,12 +317,16 @@ def test_tentative_hypothesis_with_fabricated_evidence_is_corrected() -> None:
         decision = provider.decide(_context())
 
     assert decision.action == "tool"
-    assert decision.hypotheses[0].supporting_evidence == []
+    assert decision.hypothesis_operations[0].supporting_evidence == []
     assert provider.telemetry.validation_failures == 1
+    assert provider.telemetry.first_attempt_schema_valid_decisions == 1
+    assert provider.telemetry.retry_recoveries == 1
     rejection = provider.telemetry.rejected_decisions[0]
     assert rejection.error_type == "ModelOutputValidationError"
     assert "unavailable evidence IDs" in rejection.error
-    assert rejection.decision["hypotheses"][0]["supporting_evidence"] == ["EV-NOT-YET-CREATED"]
+    assert rejection.decision["hypothesis_operations"][0]["supporting_evidence"] == [
+        "EV-NOT-YET-CREATED"
+    ]
 
 
 def test_invalid_tool_selection_is_retried_before_execution() -> None:
@@ -206,6 +345,32 @@ def test_invalid_tool_selection_is_retried_before_execution() -> None:
     assert decision.tool_request.name == "inspect_dataset"
     assert provider.telemetry.validation_failures == 1
     assert provider.telemetry.invalid_tool_calls == 1
+
+
+def test_invalid_check_id_gets_available_values_in_retry_feedback() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        decision = _tool_decision("sample_problematic_records", limit=5)
+        if attempts == 1:
+            decision["tool_request"]["check_id"] = "H-1"
+        else:
+            correction = json.loads(request.content)["messages"][-1]["content"]
+            assert "check_id must be one of the available values" in correction
+            assert "Valid check_id values: schema_contract" in correction
+            decision["tool_request"]["check_id"] = "schema_contract"
+        return httpx.Response(200, json=_ollama_response(decision))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=1)
+        decision = provider.decide(_context())
+
+    assert decision.tool_request.arguments["check_id"] == "schema_contract"
+    assert provider.telemetry.invalid_tool_calls == 1
+    assert provider.telemetry.first_attempt_schema_valid_decisions == 1
+    assert provider.telemetry.retry_recoveries == 1
 
 
 def test_invalid_tool_arguments_are_rejected() -> None:
@@ -232,7 +397,12 @@ def test_conclusion_must_reference_real_evidence() -> None:
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         provider = OllamaInvestigationModel(client=client, max_retries=1)
-        decision = provider.decide(_context([evidence]))
+        decision = provider.decide(
+            _context(
+                [evidence],
+                [RootCauseHypothesis("H-1", "The upstream schema changed", "schema_change")],
+            )
+        )
 
     assert decision.conclusion.evidence_references == ["EV-REAL"]
     assert provider.telemetry.validation_failures == 1
@@ -315,13 +485,18 @@ def test_tool_argument_outside_allowed_range_is_rejected() -> None:
 def test_unsupported_diagnosis_code_is_rejected() -> None:
     evidence = Evidence("EV-REAL", "inspect_dataset", "Observed schema", {})
     decision = _conclusion("EV-REAL")
-    decision["hypotheses"][0]["diagnosis_code"] = "database_hack"
+    decision["hypothesis_operations"][0]["diagnosis_code"] = "database_hack"
     decision["conclusion"]["diagnosis_code"] = "database_hack"
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=_ollama_response(decision)))
     with httpx.Client(transport=transport) as client:
         provider = OllamaInvestigationModel(client=client, max_retries=0)
-        with pytest.raises(ModelOutputValidationError, match="unsupported diagnosis"):
-            provider.decide(_context([evidence]))
+        with pytest.raises(ModelOutputValidationError, match="invalid structured decision"):
+            provider.decide(
+                _context(
+                    [evidence],
+                    [RootCauseHypothesis("H-1", "The upstream schema changed", "schema_change")],
+                )
+            )
 
 
 @pytest.mark.parametrize(

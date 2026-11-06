@@ -201,7 +201,8 @@ class SQLiteHistoryRepository:
                     summary TEXT NOT NULL,
                     data_json TEXT NOT NULL,
                     success INTEGER NOT NULL,
-                    error TEXT
+                    error TEXT,
+                    result_kind TEXT NOT NULL DEFAULT 'informative'
                 );
                 CREATE INDEX IF NOT EXISTS execution_ingested_idx
                     ON pipeline_execution(ingestion_timestamp DESC);
@@ -209,6 +210,22 @@ class SQLiteHistoryRepository:
                     ON investigation_session(incident_id, started_at DESC);
                 """
             )
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(evidence)").fetchall()
+            }
+            if "result_kind" not in columns:
+                connection.execute(
+                    "ALTER TABLE evidence ADD COLUMN result_kind TEXT NOT NULL "
+                    "DEFAULT 'informative'"
+                )
+                connection.execute(
+                    """UPDATE evidence
+                       SET result_kind = CASE
+                           WHEN success = 0 AND error = 'duplicate tool request' THEN 'duplicate'
+                           WHEN success = 0 THEN 'invalid'
+                           ELSE 'informative'
+                       END"""
+                )
 
     def save_pipeline_run(
         self, run: PipelineRun, frame: pd.DataFrame, *, ingested_at: datetime | None = None
@@ -439,8 +456,8 @@ class SQLiteHistoryRepository:
             connection.execute(
                 """INSERT INTO evidence
                    (evidence_id, investigation_id, tool_sequence, tool_name,
-                    summary, data_json, success, error)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    summary, data_json, success, error, result_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     evidence.evidence_id,
                     investigation_id,
@@ -450,6 +467,7 @@ class SQLiteHistoryRepository:
                     _dump(evidence.data),
                     int(evidence.success),
                     evidence.error,
+                    evidence.result_kind.value,
                 ),
             )
 
@@ -552,7 +570,7 @@ class SQLiteHistoryRepository:
             ).fetchall()
             evidence = connection.execute(
                 """SELECT evidence_id, tool_sequence, tool_name, summary, data_json,
-                          success, error
+                          success, error, result_kind
                    FROM evidence WHERE investigation_id = ? ORDER BY tool_sequence""",
                 (investigation_id,),
             ).fetchall()
@@ -599,6 +617,7 @@ class SQLiteHistoryRepository:
                     "data": json.loads(row["data_json"]),
                     "success": bool(row["success"]),
                     "error": row["error"],
+                    "result_kind": row["result_kind"],
                 }
                 for row in evidence
             ],

@@ -14,12 +14,12 @@ from retail_guardian.storage import SQLiteHistoryRepository
 def _tool_decision() -> dict:
     return {
         "action": "tool",
-        "hypotheses": [
+        "hypothesis_operations": [
             {
+                "operation": "create",
                 "hypothesis_id": "H-1",
                 "statement": "Validation evidence is needed",
                 "diagnosis_code": None,
-                "status": "active",
                 "supporting_evidence": [],
                 "contradicting_evidence": [],
             }
@@ -35,12 +35,12 @@ def _tool_decision() -> dict:
 def _conclusion(evidence_id: str) -> dict:
     return {
         "action": "conclude",
-        "hypotheses": [
+        "hypothesis_operations": [
             {
+                "operation": "confirm",
                 "hypothesis_id": "H-1",
                 "statement": "The feed contains duplicate order records",
                 "diagnosis_code": "duplicate_records",
-                "status": "confirmed",
                 "supporting_evidence": [evidence_id],
                 "contradicting_evidence": [],
             }
@@ -73,13 +73,13 @@ def test_ollama_drives_graph_and_persists_full_trace(tmp_path, as_of) -> None:
         calls += 1
         if calls == 1:
             decision = _tool_decision()
-            decision["hypotheses"][0]["supporting_evidence"] = ["EV-PENDING"]
+            decision["hypothesis_operations"][0]["supporting_evidence"] = ["EV-PENDING"]
         elif calls == 2:
             decision = _tool_decision()
         else:
             request_payload = json.loads(request.content)
             context = json.loads(request_payload["messages"][1]["content"])
-            evidence_id = context["evidence"][0]["evidence_id"]
+            evidence_id = next(iter(context["evidence_registry"]))
             decision = _conclusion(evidence_id)
         return httpx.Response(
             200,
@@ -103,14 +103,17 @@ def test_ollama_drives_graph_and_persists_full_trace(tmp_path, as_of) -> None:
     assert report.decision_count == 2
     assert report.invalid_tool_calls == 0
     assert report.model_validation_failures == 1
+    assert report.first_attempt_schema_valid_decisions == 2
+    assert report.retry_recoveries == 1
     assert trace is not None
     assert len(trace["decisions"]) == 2
     assert len(trace["tool_calls"]) == 1
     assert len(trace["rejected_model_decisions"]) == 1
     rejected = trace["rejected_model_decisions"][0]
     assert "unavailable evidence IDs" in rejected["error"]
-    assert rejected["decision"]["hypotheses"][0]["supporting_evidence"] == ["EV-PENDING"]
+    assert rejected["decision"]["hypothesis_operations"][0]["supporting_evidence"] == ["EV-PENDING"]
     assert trace["evidence"][0]["evidence_id"] in report.conclusion.evidence_references
+    assert trace["evidence"][0]["result_kind"] == "informative"
 
 
 def test_ollama_connection_failure_produces_failed_report(tmp_path, as_of) -> None:
@@ -154,11 +157,16 @@ def test_duplicate_tools_are_rejected_and_budget_terminates(tmp_path, as_of) -> 
     repository = SQLiteHistoryRepository(tmp_path / "history.db")
     incident = run_scenario("missing_values", as_of=as_of, repository=repository, ingested_at=as_of)
 
-    report = InvestigationAgent(repository, _DuplicateToolModel(), max_tool_calls=2).investigate(
-        incident.report.incident_id
-    )
+    report = InvestigationAgent(
+        repository,
+        _DuplicateToolModel(),
+        max_tool_calls=2,
+        max_invalid_tool_calls=1,
+    ).investigate(incident.report.incident_id)
 
     assert report.status == "inconclusive"
     assert report.tool_call_count == 2
     assert report.invalid_tool_calls == 1
+    assert report.successful_tool_calls == 1
     assert report.evidence[-1].error == "duplicate tool request"
+    assert "invalid tool-request limit" in report.conclusion.final_diagnosis

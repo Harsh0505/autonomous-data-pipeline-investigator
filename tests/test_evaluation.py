@@ -19,6 +19,8 @@ def test_benchmark_evaluates_all_hidden_failure_labels(tmp_path, as_of) -> None:
     assert summary.accuracy == 1.0
     assert summary.evidence_support_rate == 1.0
     assert summary.completion_rate == 1.0
+    assert summary.workflow_completion_rate == 1.0
+    assert summary.resolution_rate == 1.0
     assert summary.average_tool_calls == 2.0
     assert summary.total_tokens is None
     assert summary.baseline_accuracy == 1.0
@@ -27,6 +29,13 @@ def test_benchmark_evaluates_all_hidden_failure_labels(tmp_path, as_of) -> None:
     assert summary.model_name == "heuristic"
     assert summary.average_duration_seconds >= 0
     assert summary.invalid_tool_calls == 0
+    assert summary.informative_tool_calls == 12
+    assert summary.empty_tool_calls == 0
+    assert summary.duplicate_tool_calls == 0
+    assert summary.first_attempt_schema_validity_rate == 1.0
+    assert summary.retry_recoveries == 0
     assert summary.model_validation_failures == 0
     assert summary.investigation_failures == 0
     assert summary.timeouts == 0
+    assert summary.benchmark_scope == "deterministic_incident_regression"
+    assert "does not measure ambiguous" in summary.benchmark_disclaimer

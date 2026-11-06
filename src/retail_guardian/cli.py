@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     investigate_parser.add_argument("--timeout", type=float, default=120.0)
     investigate_parser.add_argument("--model-retries", type=int, default=2)
     investigate_parser.add_argument("--max-tool-calls", type=int, default=8)
+    investigate_parser.add_argument("--max-invalid-tool-calls", type=int, default=3)
+    investigate_parser.add_argument("--max-empty-tool-calls", type=int, default=2)
     investigate_parser.add_argument("--output", type=Path, default=None)
     benchmark_parser = subparsers.add_parser(
         "benchmark", help="Evaluate investigations against hidden synthetic ground truth"
@@ -65,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument("--rows", type=int, default=500)
     benchmark_parser.add_argument("--seed", type=int, default=42)
     benchmark_parser.add_argument("--max-tool-calls", type=int, default=8)
+    benchmark_parser.add_argument("--max-invalid-tool-calls", type=int, default=3)
+    benchmark_parser.add_argument("--max-empty-tool-calls", type=int, default=2)
     benchmark_parser.add_argument("--output", type=Path, default=None)
     trace_parser = subparsers.add_parser(
         "trace", help="Print a persisted investigation decision and tool trace"
@@ -124,7 +128,11 @@ def _run_investigation(args: argparse.Namespace) -> int:
             model_retries=args.model_retries,
         )
         report = InvestigationAgent(
-            repository, model, max_tool_calls=args.max_tool_calls
+            repository,
+            model,
+            max_tool_calls=args.max_tool_calls,
+            max_invalid_tool_calls=args.max_invalid_tool_calls,
+            max_empty_tool_calls=args.max_empty_tool_calls,
         ).investigate(args.incident_id)
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -150,6 +158,8 @@ def _run_benchmark(args: argparse.Namespace) -> int:
                     model_retries=args.model_retries,
                 ),
                 max_tool_calls=args.max_tool_calls,
+                max_invalid_tool_calls=args.max_invalid_tool_calls,
+                max_empty_tool_calls=args.max_empty_tool_calls,
             )
 
         summary = BenchmarkEvaluator(repository, agent_factory).run(
