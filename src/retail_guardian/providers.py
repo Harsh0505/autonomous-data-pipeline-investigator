@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from retail_guardian.causal_evidence import (
     CausalEvidenceError,
     assess_causal_evidence,
+    evidence_is_unavailable,
     require_causal_evidence_alignment,
     require_causal_support,
 )
@@ -748,31 +749,33 @@ def _investigation_memory(context: InvestigationContext) -> dict[str, object]:
                 informative_ids,
                 context.evidence,
             )
+            if assessment.supported:
+                state_guidance = "ready_to_confirm"
+                information_needed: list[str] = []
+            elif assessment.contradicting_evidence:
+                state_guidance = "reject_or_revise"
+                information_needed = [
+                    "Complete evidence contradicts this causal signature; reject or revise "
+                    "the hypothesis before seeking more support."
+                ]
+            else:
+                state_guidance = "collect_discriminating_evidence"
+                information_needed = list(assessment.missing_requirements)
             hypothesis_checks.append(
                 {
                     "hypothesis_id": hypothesis.hypothesis_id,
                     "status": hypothesis.status.value,
+                    "state_guidance": state_guidance,
                     "factually_supported": assessment.supported,
                     "supporting_evidence": list(assessment.supporting_evidence),
                     "contradicting_evidence": list(assessment.contradicting_evidence),
                     "relevant_nondiscriminating_evidence": list(assessment.relevant_evidence),
                     "unavailable_evidence": list(assessment.unavailable_evidence),
-                    "information_needed": list(assessment.missing_requirements),
+                    "information_needed": information_needed,
                 }
             )
     return {
-        "questions_investigated": [
-            {
-                "question_id": item.question_id,
-                "question": item.question,
-                "hypothesis_ids": item.hypothesis_ids,
-                "tool_name": item.tool_name,
-                "arguments": item.arguments,
-                "status": item.status.value,
-                "evidence_id": item.evidence_id,
-            }
-            for item in context.investigation_questions[-12:]
-        ],
+        "causal_questions": _causal_question_memory(context),
         "used_tool_calls": [
             {
                 "name": item.name,
@@ -786,6 +789,83 @@ def _investigation_memory(context: InvestigationContext) -> dict[str, object]:
         "hypothesis_checks": hypothesis_checks,
         "unexplored_tools": [item.name for item in context.available_tools],
     }
+
+
+def _causal_question_memory(context: InvestigationContext) -> list[dict[str, object]]:
+    """Group evidence requests without treating a repeated causal question as a duplicate."""
+    groups: list[dict[str, Any]] = []
+    by_text: dict[str, dict[str, Any]] = {}
+    evidence_by_id = {item.evidence_id: item for item in context.evidence}
+    hypotheses_by_id = {item.hypothesis_id: item for item in context.hypotheses}
+    informative_ids = [
+        item.evidence_id
+        for item in context.evidence
+        if item.result_kind == ToolResultKind.INFORMATIVE
+    ]
+    unexplored_operational_tools = {
+        item.name for item in context.available_tools if item.name in _CAUSAL_EVIDENCE_TOOLS
+    }
+
+    for request in context.investigation_questions[-12:]:
+        key = _normalize_question(request.question)
+        group = by_text.get(key)
+        if group is None:
+            group = {
+                "question_id": request.question_id,
+                "question": request.question,
+                "hypothesis_ids": [],
+                "status": "open",
+                "evidence_requests": [],
+            }
+            by_text[key] = group
+            groups.append(group)
+        group["hypothesis_ids"] = list(
+            dict.fromkeys([*group["hypothesis_ids"], *request.hypothesis_ids])
+        )
+        group["evidence_requests"].append(
+            {
+                "tool_name": request.tool_name,
+                "arguments": request.arguments,
+                "result": request.status.value,
+                "evidence_id": request.evidence_id,
+            }
+        )
+
+    for group in groups:
+        linked_hypotheses = [
+            hypotheses_by_id[hypothesis_id]
+            for hypothesis_id in group["hypothesis_ids"]
+            if hypothesis_id in hypotheses_by_id
+            and hypotheses_by_id[hypothesis_id].diagnosis_code is not None
+        ]
+        answered = False
+        for hypothesis in linked_hypotheses:
+            assessment = assess_causal_evidence(
+                hypothesis.diagnosis_code or "",
+                informative_ids,
+                context.evidence,
+            )
+            if assessment.supported or assessment.contradicting_evidence:
+                answered = True
+                break
+        request_evidence = [
+            evidence_by_id[item["evidence_id"]]
+            for item in group["evidence_requests"]
+            if item["evidence_id"] in evidence_by_id
+        ]
+        if not linked_hypotheses and any(
+            item.result_kind == ToolResultKind.INFORMATIVE for item in request_evidence
+        ):
+            answered = True
+        if answered:
+            group["status"] = "answered"
+        elif (
+            request_evidence
+            and not unexplored_operational_tools
+            and all(evidence_is_unavailable(item) for item in request_evidence)
+        ):
+            group["status"] = "unavailable"
+    return groups
 
 
 def _evidence_key_findings(evidence: Evidence) -> dict[str, Any]:
@@ -1151,23 +1231,20 @@ def _validate_decision_for_context(
     if decision.action == "tool":
         if decision.tool_request is None:
             raise ModelOutputValidationError("tool decision omitted tool_request")
-        question_ids = {item.question_id for item in context.investigation_questions}
-        if decision.tool_request.question_id in question_ids:
-            raise ModelOutputValidationError(
-                f"investigation question {decision.tool_request.question_id!r} was already used"
-            )
-        normalized_question = _normalize_question(decision.tool_request.question or "")
-        repeated_question = next(
+        existing_question = next(
             (
-                item.question_id
+                item
                 for item in context.investigation_questions
-                if _normalize_question(item.question) == normalized_question
+                if item.question_id == decision.tool_request.question_id
             ),
             None,
         )
-        if repeated_question is not None:
+        if existing_question is not None and _normalize_question(
+            existing_question.question
+        ) != _normalize_question(decision.tool_request.question or ""):
             raise ModelOutputValidationError(
-                f"the same causal question was already investigated as {repeated_question!r}"
+                f"investigation question ID {decision.tool_request.question_id!r} already refers "
+                "to a different causal question"
             )
         unknown_hypotheses = set(decision.tool_request.hypothesis_ids) - set(hypotheses_by_id)
         if unknown_hypotheses:
@@ -1326,8 +1403,9 @@ def _correction_feedback(
         recovery_guidance = (
             "Causal recovery mode is active. Return a tool decision with "
             "hypothesis_operations: []. Hypothesis state is frozen until the tool result is "
-            "available. Include a new question_id, one concise causal question, and the current "
-            "hypothesis IDs it distinguishes."
+            "available. Include one concise causal question, reuse its existing question_id when "
+            "continuing it through another source, and list the current hypothesis IDs it "
+            "distinguishes."
         )
     else:
         valid_actions = [f"select one available tool ({tools})"]
@@ -1353,7 +1431,8 @@ def _correction_feedback(
         "Correct that specific error and return exactly one decision matching the JSON Schema. "
         "Evidence arrays accept bare IDs only, without summaries or annotations. Use create only "
         "for a new hypothesis ID and update, confirm, or reject for an existing ID. Confirm a "
-        "supported hypothesis before concluding with a diagnosis. Do not repeat a completed tool."
+        "supported hypothesis before concluding with a diagnosis. A causal question may continue "
+        "through a different tool; do not repeat an equivalent tool request."
     )
 
 
@@ -1464,16 +1543,18 @@ hypothesis list. IDs are stable after creation. Evidence fields contain bare IDs
 citable_evidence_ids. A citable result is not automatically support: use it only when its facts
 establish the proposed mechanism. Never put prose or annotated IDs in evidence fields. Confirming
 requires supporting evidence, and a final diagnosis must match a confirmed hypothesis and cite its
-support. Before a tool action, identify one concise unanswered causal question using a new
-question_id and list the hypothesis IDs it distinguishes. Select the capability that answers that
-question and respect its limitations. Do not repeat an investigated question or an equivalent tool
-request. check_id must come from available_check_ids. Investigation paths follow findings rather
-than a fixed sequence. Revise or reject a hypothesis when hypothesis_checks identifies factual
-contradictions. Conclude as soon as evidence is sufficient; unused budget is not a reason to collect
-more. Conclude with insufficient_evidence only after available operational evidence sources are
-exhausted. Choose diagnosis_code only from diagnosis_taxonomy. Validation failures are symptoms,
-not upstream diagnoses. Develop competing causal hypotheses, seek discriminating facts, and
-distinguish timing or correlation from causal evidence. Return the requested structured decision."""
+support. Before a tool action, identify one concise causal question and list the hypothesis IDs it
+distinguishes. Reuse its question_id when another evidence source is needed for the same question;
+use a new ID for a new question. Select the capability that answers the question and respect its
+limitations. A question may use several distinct evidence sources, but never repeat an equivalent
+tool request. check_id must come from available_check_ids. Investigation paths follow findings
+rather than a fixed sequence. Revise or reject a hypothesis when hypothesis_checks identifies
+factual contradictions. Conclude as soon as evidence is sufficient; unused budget is not a reason
+to collect more. Conclude with insufficient_evidence only after available operational evidence
+sources are exhausted. Choose diagnosis_code only from diagnosis_taxonomy. Validation failures
+are symptoms, not upstream diagnoses. Develop competing causal hypotheses, seek discriminating
+facts, and distinguish timing or correlation from causal evidence. Return the requested structured
+decision."""
 
 
 _OLLAMA_SYSTEM_PROMPT = f"""{_SYSTEM_PROMPT}

@@ -282,7 +282,7 @@ def test_forced_tool_recovery_preserves_hypotheses_then_resolves_retry(tmp_path,
                 not item["supporting_evidence"] and not item["contradicting_evidence"]
                 for item in context["current_hypotheses"]
             )
-            assert [item["status"] for item in memory["questions_investigated"]] == [
+            assert [item["status"] for item in memory["causal_questions"]] == [
                 "answered",
                 "answered",
             ]
@@ -292,6 +292,7 @@ def test_forced_tool_recovery_preserves_hypotheses_then_resolves_retry(tmp_path,
             assert replay_check["contradicting_evidence"] == [
                 evidence_by_tool["get_supplier_submissions"]
             ]
+            assert replay_check["state_guidance"] == "reject_or_revise"
             assert replay_check["information_needed"]
             decision = _causal_tool(
                 "get_pipeline_logs",

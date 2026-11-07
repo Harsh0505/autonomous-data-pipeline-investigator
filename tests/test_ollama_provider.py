@@ -9,6 +9,8 @@ from retail_guardian.investigation_models import (
     CompletedToolCall,
     Evidence,
     InvestigationContext,
+    InvestigationQuestion,
+    QuestionStatus,
     RootCauseHypothesis,
     ToolDefinition,
 )
@@ -143,6 +145,57 @@ def test_ollama_returns_structured_tool_decision() -> None:
     assert provider.telemetry.calls == 1
     assert provider.telemetry.provider_name == "ollama"
     assert provider.telemetry.first_attempt_schema_valid_decisions == 1
+
+
+def test_same_causal_question_can_use_multiple_distinct_tools() -> None:
+    question = "Did an internal retry repeat already committed output?"
+    context = InvestigationContext(
+        incident={"incident_id": "INC-CAUSAL", "violations": []},
+        hypotheses=[],
+        evidence=[],
+        available_tools=[
+            ToolDefinition("get_orchestration_events", "Read task attempts", {}),
+        ],
+        remaining_tool_calls=3,
+        investigation_questions=[
+            InvestigationQuestion(
+                "q3",
+                question,
+                [],
+                "get_pipeline_logs",
+                {},
+                QuestionStatus.ANSWERED,
+                "EV-LOGS",
+            )
+        ],
+        investigation_objective="identify_underlying_root_cause",
+        allowed_diagnosis_codes=["supplier_batch_replay", "failed_job_retry"],
+    )
+    response = _tool_decision("get_orchestration_events")
+    response["hypothesis_operations"] = []
+    response["tool_request"].update(
+        {
+            "question_id": "q4",
+            "question": question,
+            "hypothesis_ids": [],
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        supplied_context = json.loads(json.loads(request.content)["messages"][1]["content"])
+        causal_questions = supplied_context["investigation_memory"]["causal_questions"]
+        assert len(causal_questions) == 1
+        assert causal_questions[0]["question_id"] == "q3"
+        assert causal_questions[0]["evidence_requests"][0]["tool_name"] == "get_pipeline_logs"
+        return httpx.Response(200, json=_ollama_response(response))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaInvestigationModel(client=client, max_retries=0)
+        decision = provider.decide(context)
+
+    assert decision.action == "tool"
+    assert decision.tool_request.name == "get_orchestration_events"
+    assert decision.tool_request.question == question
 
 
 def test_ollama_context_summarizes_evidence_and_removes_completed_tools() -> None:

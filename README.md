@@ -52,11 +52,12 @@ write, and row multiplication in a join. The deliberately incomplete case can on
 `insufficient_evidence`.
 
 Each model turn includes one compact canonical evidence registry, exact citable evidence IDs, valid
-failed-check IDs, and an investigation memory. The memory records answered, unavailable, and failed
-questions; normalized tool calls; hypothesis-specific supporting and contradicting evidence; and
-the information still needed. A compact capability catalog explains what each remaining tool can
-answer and what it cannot establish. Tool decisions must name one unanswered causal question, so
-planning remains structured without introducing a long free-text plan.
+failed-check IDs, and an investigation memory. The memory keeps causal questions separate from
+their evidence requests, records normalized tool calls, and exposes hypothesis-specific supporting
+and contradicting evidence plus the information still needed. One causal question may use several
+distinct tools; only equivalent tool name-and-argument requests are duplicates. A compact capability
+catalog explains what each remaining tool can answer and what it cannot establish. This keeps
+planning structured without introducing a long free-text plan.
 
 The workflow owns hypothesis state while the model emits explicit create, update, confirm, or reject
 operations. Stable hypothesis IDs and cumulative evidence survive across turns. Tentative
@@ -321,10 +322,22 @@ the final report. It deliberately excludes private reasoning tokens.
 Ollama token totals include every response carrying usage metadata, including structured decisions
 that exhaust their retry budget. A recorded zero is kept distinct from unavailable usage metadata.
 
-Version 3.0 intentionally replaces model-authored full hypothesis snapshots with explicit
-hypothesis operations and adds `result_kind` to evidence. Existing SQLite databases are migrated on
-open. Legacy custom providers that still return complete hypothesis snapshots remain supported and
-their entries are merged by hypothesis ID rather than replacing workflow state.
+Version 3.0 intentionally replaced model-authored full hypothesis snapshots with explicit
+hypothesis operations and added `result_kind` to evidence. Version 3.1 adds the persisted
+investigation-question ledger while retaining all version 3.0 fields. Existing SQLite databases are
+migrated on open. Legacy custom providers that still return complete hypothesis snapshots remain
+supported and their entries are merged by hypothesis ID rather than replacing workflow state.
+
+## Local-model limitations
+
+`qwen3:4b` is useful for a local demonstration but is not a reliability boundary. It can anchor on
+its first hypothesis, choose a tool whose capability does not match its stated question, or require
+structured-output retries. Results can vary across Ollama and model builds even with deterministic
+sampling. The workflow therefore validates evidence and hypothesis transitions independently,
+bounds every request class, and reports failure or insufficient evidence rather than accepting an
+unsupported diagnosis. Use the deterministic suites for workflow regression and the root-cause
+benchmark for measured model evaluation; neither a single successful run nor the mock provider is
+evidence of production-grade causal reasoning.
 
 ## RX 6600 XT and performance troubleshooting
 
