@@ -449,6 +449,14 @@ def _cause_records(
             ),
         ]
     if root_cause == RootCause.LEGITIMATE_TAXONOMY_UPDATE:
+        category_prices = pd.to_numeric(
+            frame.loc[frame["product_category"].eq("collectibles"), "unit_price"],
+            errors="coerce",
+        ).dropna()
+        mean_price = float(category_prices.mean())
+        price_std = float(category_prices.std(ddof=0))
+        if price_std <= 0:
+            price_std = max(mean_price * 0.2, 1.0)
         return [
             (
                 OperationalRecordType.CONFIGURATION_CHANGE,
@@ -459,6 +467,12 @@ def _cause_records(
                     "status": "approved",
                     "effective_at": (as_of - timedelta(hours=2)).isoformat(),
                     "added_categories": ["collectibles"],
+                    "category_profiles": {
+                        "collectibles": {
+                            "mean_price": mean_price,
+                            "price_std": price_std,
+                        }
+                    },
                     "target_version": "taxonomy-19",
                 },
             ),

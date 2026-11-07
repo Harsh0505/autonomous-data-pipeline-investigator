@@ -15,6 +15,12 @@ from retail_guardian.providers import (
     OllamaInvestigationModel,
     OpenAIInvestigationModel,
 )
+from retail_guardian.repair import RepairWorkflow, RepairWorkflowError
+from retail_guardian.repair_providers import (
+    DeterministicRepairPlanningModel,
+    OllamaRepairPlanningModel,
+    RepairPlanningError,
+)
 from retail_guardian.root_cause_evaluation import RootCauseBenchmarkEvaluator
 from retail_guardian.scenarios import SCENARIOS, run_scenario
 from retail_guardian.storage import SQLiteHistoryRepository
@@ -109,6 +115,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trace_parser.add_argument("--investigation-id", required=True)
     trace_parser.add_argument("--database", type=Path, default=Path("artifacts/history.db"))
+    propose_parser = subparsers.add_parser(
+        "propose-repair", help="Generate a safe repair proposal for an investigation"
+    )
+    propose_parser.add_argument("--investigation-id", required=True)
+    propose_parser.add_argument("--database", type=Path, default=Path("artifacts/history.db"))
+    propose_parser.add_argument("--provider", choices=("mock", "ollama"), default="ollama")
+    propose_parser.add_argument("--model", default=None)
+    propose_parser.add_argument("--endpoint", default=None)
+    propose_parser.add_argument("--timeout", type=float, default=120.0)
+    propose_parser.add_argument("--model-retries", type=int, default=2)
+    propose_parser.add_argument("--output", type=Path, default=None)
+    for command, help_text in (
+        ("show-repair", "Display a persisted repair proposal"),
+        ("approve-repair", "Approve a repair for isolated simulation"),
+        ("simulate-repair", "Run an approved repair in isolation and verify it"),
+        ("repair-result", "Display repair transitions and verification results"),
+    ):
+        repair_parser = subparsers.add_parser(command, help=help_text)
+        repair_parser.add_argument("--repair-id", required=True)
+        repair_parser.add_argument("--database", type=Path, default=Path("artifacts/history.db"))
+        repair_parser.add_argument("--output", type=Path, default=None)
     return parser
 
 
@@ -125,6 +152,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_root_cause_benchmark(args)
     if args.command == "trace":
         return _show_trace(args)
+    if args.command == "propose-repair":
+        return _propose_repair(args)
+    if args.command == "show-repair":
+        return _show_repair(args)
+    if args.command == "approve-repair":
+        return _approve_repair(args)
+    if args.command == "simulate-repair":
+        return _simulate_repair(args)
+    if args.command == "repair-result":
+        return _show_repair_result(args)
     if args.command == "run-root-cause":
         return _run_root_cause_scenario(args)
 
@@ -283,6 +320,89 @@ def _show_trace(args: argparse.Namespace) -> int:
         return 2
     print(json.dumps(trace, indent=2, sort_keys=True))
     return 0
+
+
+def _propose_repair(args: argparse.Namespace) -> int:
+    try:
+        repository = SQLiteHistoryRepository(args.database)
+        planner = (
+            OllamaRepairPlanningModel(
+                args.model,
+                endpoint=args.endpoint,
+                timeout_seconds=args.timeout,
+                max_retries=args.model_retries,
+            )
+            if args.provider == "ollama"
+            else DeterministicRepairPlanningModel()
+        )
+        record = RepairWorkflow(repository, planner).propose(args.investigation_id)
+    except (RepairPlanningError, RepairWorkflowError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    output = record.to_json()
+    _write_optional_output(args.output, output)
+    print(output)
+    return 0
+
+
+def _show_repair(args: argparse.Namespace) -> int:
+    repository = SQLiteHistoryRepository(args.database)
+    record = repository.get_repair(args.repair_id)
+    if record is None:
+        print(f"error: repair not found: {args.repair_id}", file=sys.stderr)
+        return 2
+    output = record.to_json()
+    _write_optional_output(args.output, output)
+    print(output)
+    return 0
+
+
+def _approve_repair(args: argparse.Namespace) -> int:
+    try:
+        repository = SQLiteHistoryRepository(args.database)
+        workflow = RepairWorkflow(repository, DeterministicRepairPlanningModel())
+        record = workflow.approve_for_simulation(args.repair_id)
+    except (RepairWorkflowError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    output = record.to_json()
+    _write_optional_output(args.output, output)
+    print(output)
+    return 0
+
+
+def _simulate_repair(args: argparse.Namespace) -> int:
+    try:
+        repository = SQLiteHistoryRepository(args.database)
+        record = RepairWorkflow(repository, DeterministicRepairPlanningModel()).simulate(
+            args.repair_id
+        )
+    except (RepairWorkflowError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    output = record.to_json()
+    _write_optional_output(args.output, output)
+    print(output)
+    return 0 if record.verification and record.verification.passed else 1
+
+
+def _show_repair_result(args: argparse.Namespace) -> int:
+    repository = SQLiteHistoryRepository(args.database)
+    trace = repository.get_repair_trace(args.repair_id)
+    if trace is None:
+        print(f"error: repair not found: {args.repair_id}", file=sys.stderr)
+        return 2
+    output = json.dumps(trace, indent=2, sort_keys=True)
+    _write_optional_output(args.output, output)
+    print(output)
+    return 0
+
+
+def _write_optional_output(path: Path | None, content: str) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content + "\n", encoding="utf-8")
 
 
 def _build_model(

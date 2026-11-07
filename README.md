@@ -1,11 +1,11 @@
-# Retail Pipeline Guardian — Autonomous root-cause investigation
+# Retail Pipeline Guardian — Autonomous investigation and safe repair
 
 Retail Pipeline Guardian detects failures in synthetic multi-supplier retail feeds and investigates
-incidents through a bounded, evidence-driven LangGraph workflow. In addition to classifying data
-quality failures, version 0.4.0 investigates competing upstream causal mechanisms from operational
-evidence. It supports real local inference through Ollama while preserving the deterministic test
-provider and optional OpenAI provider. Autonomous repair, FastAPI, and the frontend remain out of
-scope.
+incidents through bounded, evidence-driven LangGraph workflows. Version 0.5.0 investigates
+competing upstream causal mechanisms, proposes typed repairs, simulates them against immutable
+synthetic snapshots, and verifies the results deterministically. It supports local inference through
+Ollama while preserving deterministic providers for reproducible tests. Production mutation,
+FastAPI, and the frontend remain out of scope.
 
 The project can run real autonomous investigations locally without API credentials or paid services.
 
@@ -14,8 +14,9 @@ The project can run real autonomous investigations locally without API credentia
 The pipeline persists execution metadata, schemas, statistical profiles, validation results,
 bounded problematic-record samples, and synthetic operational records in SQLite. Operational
 records cover supplier submissions, execution logs, orchestration attempts, transformation lineage,
-and configuration changes. Full datasets are not copied into the history store. Benchmark labels
-remain in memory and never enter incident JSON, SQLite, model prompts, or investigation tools.
+and configuration changes. SQLite also stores an insert-once synthetic dataset snapshot for isolated
+repair simulation. Full records are not sent to the model. Benchmark labels remain in memory and
+never enter incident JSON, SQLite, model prompts, or investigation tools.
 
 The LangGraph workflow repeatedly asks the configured model to make one structured decision:
 
@@ -98,6 +99,11 @@ src/retail_guardian/
   investigation_tools.py    Data-quality and operational investigation tools
   providers.py              Mock, Ollama, and OpenAI providers
   investigation.py          Bounded LangGraph investigation workflow
+  repair_models.py          Typed proposals, lifecycle state, and verification reports
+  repair_operations.py      Scoped deterministic repair operations
+  repair_providers.py       Separate mock and Ollama repair-planning agents
+  repair_verification.py    Deterministic repair acceptance criteria
+  repair.py                 LangGraph planning and isolated simulation workflows
   evaluation.py             Six-scenario evaluation and validation-rule baseline
   root_cause_evaluation.py  Separate ambiguous causal benchmark and metrics
   cli.py                    Pipeline, investigation, trace, and benchmark commands
@@ -294,6 +300,74 @@ tool names. The deliberately incomplete case is correct only after the agent est
 relevant retry and lineage audit data are unavailable. The deterministic mock deliberately returns
 inconclusive for causal cases; it is useful for infrastructure checks, not as a reasoning baseline.
 
+## Safe repair planning and verification
+
+The repair workflow keeps agent responsibilities separate:
+
+```text
+completed investigation
+        |
+        v
+repair-planning agent --> validated typed proposal --> explicit simulation approval
+                                                        |
+                                                        v
+immutable snapshot --> isolated repair operation --> deterministic verification
+                                                        |
+                                                        v
+                                              recommended or rejected
+```
+
+The LLM may select only a listed capability and validated candidate parameters. It cannot submit
+code, SQL, shell commands, or external mutations. Simulation always works on a deep copy of the
+insert-once synthetic snapshot. There is no production-apply command; rollback means discarding the
+isolated copy.
+
+Supported operations are:
+
+- `deduplicate_records`: remove additional rows only for explicitly selected duplicate order IDs;
+- `correct_supplier_currency`: restore one supplier's currency code from its configured contract;
+- `activate_approved_category`: load a category only when an approved configuration-change record
+  names it.
+
+Verification reruns all data-quality checks and requires every original failure listed in the
+proposal to pass. It also rejects new failures, unexpected row loss, changes outside the selected
+records or columns, and any mutation of the original snapshot. Business row, order, quantity, and
+local-revenue aggregates are recorded before and after. The LLM does not decide the result.
+
+Run a complete deterministic example:
+
+```powershell
+$database = "artifacts\repair-demo.db"
+
+retail-guardian run `
+  --scenario duplicate_records `
+  --rows 500 `
+  --seed 42 `
+  --as-of 2026-10-20T12:00:00Z `
+  --database $database `
+  --output-dir artifacts\repair-demo
+
+$incident = Get-Content artifacts\repair-demo\duplicate_records-incident.json |
+  ConvertFrom-Json
+$investigation = retail-guardian investigate `
+  --provider mock `
+  --database $database `
+  --incident-id $incident.incident_id | ConvertFrom-Json
+
+$repair = retail-guardian propose-repair `
+  --provider mock `
+  --database $database `
+  --investigation-id $investigation.investigation_id | ConvertFrom-Json
+
+retail-guardian show-repair --database $database --repair-id $repair.repair_id
+retail-guardian approve-repair --database $database --repair-id $repair.repair_id
+retail-guardian simulate-repair --database $database --repair-id $repair.repair_id
+retail-guardian repair-result --database $database --repair-id $repair.repair_id
+```
+
+Use `--provider ollama --model qwen3:4b` on `propose-repair` to test the real local repair
+planner. Investigation-provider and repair-provider choices are independent.
+
 ## Inspect reports and complete traces
 
 The investigation output uses schema version 3.1 and contains the conclusion, final hypothesis
@@ -403,4 +477,9 @@ hypothesis revision, trace persistence, both benchmark suites, and hidden-label 
 - Confidence labels express qualitative uncertainty, not calibrated probabilities.
 - Small local models can remain inconsistent despite structured schemas and retries; inconclusive or
   failed reports are valid outcomes.
+- Repair simulation supports three reviewed operations and local synthetic snapshots only. Missing
+  source values, external systems, scheduler changes, deployment, and production mutation are not
+  supported.
+- A recommended data repair resolves the verified incident state but does not by itself correct an
+  upstream supplier, retry, join, or deployment mechanism.
 - RX 6600 XT acceleration is environment-dependent and must be verified locally.

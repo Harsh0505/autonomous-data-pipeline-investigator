@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 
 from retail_guardian.cli import main
-from retail_guardian.providers import OllamaInvestigationModel
+from retail_guardian.investigation import InvestigationAgent
+from retail_guardian.providers import HeuristicInvestigationModel, OllamaInvestigationModel
+from retail_guardian.scenarios import run_scenario
+from retail_guardian.storage import SQLiteHistoryRepository
 
 
 def test_cli_writes_healthy_outputs(tmp_path, capsys) -> None:
@@ -137,3 +140,50 @@ def test_cli_root_cause_benchmark_is_separate_from_regression_suite(tmp_path, ca
     assert payload["benchmark_scope"] == "ambiguous_upstream_root_cause"
     assert len(payload["cases"]) == 10
     assert payload["provider_name"] == "mock"
+
+
+def test_cli_proposes_approves_simulates_and_inspects_repair(tmp_path, capsys, as_of) -> None:
+    database = tmp_path / "repair.db"
+    repository = SQLiteHistoryRepository(database)
+    run = run_scenario(
+        "duplicate_records",
+        row_count=50,
+        seed=42,
+        as_of=as_of,
+        ingested_at=as_of,
+        repository=repository,
+    )
+    investigation = InvestigationAgent(repository, HeuristicInvestigationModel()).investigate(
+        run.report.incident_id
+    )
+
+    assert (
+        main(
+            [
+                "propose-repair",
+                "--provider",
+                "mock",
+                "--database",
+                str(database),
+                "--investigation-id",
+                investigation.investigation_id,
+            ]
+        )
+        == 0
+    )
+    proposed = json.loads(capsys.readouterr().out)
+    repair_id = proposed["repair_id"]
+    assert proposed["status"] == "proposed"
+
+    assert main(["approve-repair", "--database", str(database), "--repair-id", repair_id]) == 0
+    approved = json.loads(capsys.readouterr().out)
+    assert approved["status"] == "approved_for_simulation"
+
+    assert main(["simulate-repair", "--database", str(database), "--repair-id", repair_id]) == 0
+    completed = json.loads(capsys.readouterr().out)
+    assert completed["status"] == "recommended"
+    assert completed["verification"]["passed"] is True
+
+    assert main(["repair-result", "--database", str(database), "--repair-id", repair_id]) == 0
+    trace = json.loads(capsys.readouterr().out)
+    assert [event["status"] for event in trace["events"]][-1] == "recommended"

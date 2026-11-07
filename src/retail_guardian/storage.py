@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -20,6 +21,7 @@ from retail_guardian.investigation_models import (
 )
 from retail_guardian.models import CheckResult, _json_ready
 from retail_guardian.pipeline import PipelineRun
+from retail_guardian.repair_models import RepairRecord
 
 
 class HistoryRepository(Protocol):
@@ -92,6 +94,16 @@ class HistoryRepository(Protocol):
     ) -> None: ...
 
     def complete_investigation(self, report: InvestigationReport) -> None: ...
+
+    def get_investigation_report(self, investigation_id: str) -> dict[str, Any] | None: ...
+
+    def get_dataset_snapshot(self, execution_id: str) -> pd.DataFrame | None: ...
+
+    def create_repair(self, record: RepairRecord) -> None: ...
+
+    def update_repair(self, record: RepairRecord, event_details: dict[str, Any]) -> None: ...
+
+    def get_repair(self, repair_id: str) -> RepairRecord | None: ...
 
 
 class SQLiteHistoryRepository:
@@ -224,12 +236,42 @@ class SQLiteHistoryRepository:
                     error TEXT,
                     result_kind TEXT NOT NULL DEFAULT 'informative'
                 );
+                CREATE TABLE IF NOT EXISTS dataset_snapshot (
+                    execution_id TEXT PRIMARY KEY REFERENCES pipeline_execution(execution_id),
+                    frame_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS repair_session (
+                    repair_id TEXT PRIMARY KEY,
+                    investigation_id TEXT NOT NULL
+                        REFERENCES investigation_session(investigation_id),
+                    status TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    simulation_json TEXT,
+                    verification_json TEXT,
+                    rejection_reason TEXT,
+                    proposed_at TEXT NOT NULL,
+                    approved_at TEXT,
+                    simulated_at TEXT,
+                    verified_at TEXT,
+                    completed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS repair_event (
+                    repair_id TEXT NOT NULL REFERENCES repair_session(repair_id),
+                    sequence INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (repair_id, sequence)
+                );
                 CREATE INDEX IF NOT EXISTS execution_ingested_idx
                     ON pipeline_execution(ingestion_timestamp DESC);
                 CREATE INDEX IF NOT EXISTS investigation_incident_idx
                     ON investigation_session(incident_id, started_at DESC);
                 CREATE INDEX IF NOT EXISTS operational_record_execution_idx
                     ON operational_record(execution_id, record_type, occurred_at);
+                CREATE INDEX IF NOT EXISTS repair_investigation_idx
+                    ON repair_session(investigation_id, proposed_at DESC);
                 """
             )
             columns = {
@@ -248,6 +290,12 @@ class SQLiteHistoryRepository:
                            ELSE 'informative'
                        END"""
                 )
+            repair_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(repair_session)").fetchall()
+            }
+            if "verified_at" not in repair_columns:
+                connection.execute("ALTER TABLE repair_session ADD COLUMN verified_at TEXT")
 
     def save_pipeline_run(
         self, run: PipelineRun, frame: pd.DataFrame, *, ingested_at: datetime | None = None
@@ -349,6 +397,16 @@ class SQLiteHistoryRepository:
                         report.detected_at.isoformat(),
                     ),
                 )
+            connection.execute(
+                """INSERT INTO dataset_snapshot (execution_id, frame_json, created_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(execution_id) DO NOTHING""",
+                (
+                    run.execution_id,
+                    frame.to_json(orient="table", date_format="iso", index=False),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
 
     def get_incident(self, incident_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -610,6 +668,132 @@ class SQLiteHistoryRepository:
                 ),
             )
 
+    def get_investigation_report(self, investigation_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT report_json FROM investigation_session WHERE investigation_id = ?",
+                (investigation_id,),
+            ).fetchone()
+        if row is None or row["report_json"] is None:
+            return None
+        return json.loads(row["report_json"])
+
+    def get_dataset_snapshot(self, execution_id: str) -> pd.DataFrame | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT frame_json FROM dataset_snapshot WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return pd.read_json(StringIO(row["frame_json"]), orient="table")
+
+    def create_repair(self, record: RepairRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO repair_session
+                   (repair_id, investigation_id, status, proposal_json, simulation_json,
+                    verification_json, rejection_reason, proposed_at, approved_at,
+                    simulated_at, verified_at, completed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                _repair_row(record),
+            )
+            connection.execute(
+                """INSERT INTO repair_event
+                   (repair_id, sequence, status, details_json, created_at)
+                   VALUES (?, 1, ?, ?, ?)""",
+                (
+                    record.repair_id,
+                    record.status.value,
+                    _dump({"proposal": record.proposal.model_dump(mode="json")}),
+                    record.proposed_at.isoformat(),
+                ),
+            )
+
+    def update_repair(self, record: RepairRecord, event_details: dict[str, Any]) -> None:
+        event_time = (
+            record.completed_at or record.verified_at or record.simulated_at or record.approved_at
+        )
+        if event_time is None:
+            raise ValueError("repair update requires a transition timestamp")
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM repair_session WHERE repair_id = ?", (record.repair_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"repair not found: {record.repair_id}")
+            connection.execute(
+                """UPDATE repair_session
+                   SET status = ?, proposal_json = ?, simulation_json = ?,
+                       verification_json = ?, rejection_reason = ?, approved_at = ?,
+                       simulated_at = ?, verified_at = ?, completed_at = ?
+                   WHERE repair_id = ?""",
+                (
+                    record.status.value,
+                    record.proposal.model_dump_json(),
+                    None if record.simulation is None else record.simulation.model_dump_json(),
+                    (
+                        None
+                        if record.verification is None
+                        else record.verification.model_dump_json()
+                    ),
+                    record.rejection_reason,
+                    _optional_datetime(record.approved_at),
+                    _optional_datetime(record.simulated_at),
+                    _optional_datetime(record.verified_at),
+                    _optional_datetime(record.completed_at),
+                    record.repair_id,
+                ),
+            )
+            sequence = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM repair_event WHERE repair_id = ?",
+                (record.repair_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO repair_event
+                   (repair_id, sequence, status, details_json, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    record.repair_id,
+                    sequence,
+                    record.status.value,
+                    _dump(event_details),
+                    event_time.isoformat(),
+                ),
+            )
+
+    def get_repair(self, repair_id: str) -> RepairRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM repair_session WHERE repair_id = ?", (repair_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return _repair_record(row)
+
+    def get_repair_trace(self, repair_id: str) -> dict[str, Any] | None:
+        record = self.get_repair(repair_id)
+        if record is None:
+            return None
+        with self._connect() as connection:
+            events = connection.execute(
+                """SELECT sequence, status, details_json, created_at
+                   FROM repair_event WHERE repair_id = ? ORDER BY sequence""",
+                (repair_id,),
+            ).fetchall()
+        return {
+            "repair": record.model_dump(mode="json"),
+            "events": [
+                {
+                    "sequence": row["sequence"],
+                    "status": row["status"],
+                    "details": json.loads(row["details_json"]),
+                    "created_at": row["created_at"],
+                }
+                for row in events
+            ],
+        }
+
     def get_investigations(self, incident_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -832,6 +1016,49 @@ def _execution_dict(row: sqlite3.Row) -> dict[str, Any]:
         "row_count": row["row_count"],
         "aggregate_metrics": json.loads(row["aggregate_metrics_json"]),
     }
+
+
+def _repair_row(record: RepairRecord) -> tuple[Any, ...]:
+    return (
+        record.repair_id,
+        record.investigation_id,
+        record.status.value,
+        record.proposal.model_dump_json(),
+        None if record.simulation is None else record.simulation.model_dump_json(),
+        None if record.verification is None else record.verification.model_dump_json(),
+        record.rejection_reason,
+        record.proposed_at.isoformat(),
+        _optional_datetime(record.approved_at),
+        _optional_datetime(record.simulated_at),
+        _optional_datetime(record.verified_at),
+        _optional_datetime(record.completed_at),
+    )
+
+
+def _repair_record(row: sqlite3.Row) -> RepairRecord:
+    payload = {
+        "repair_id": row["repair_id"],
+        "investigation_id": row["investigation_id"],
+        "status": row["status"],
+        "proposal": json.loads(row["proposal_json"]),
+        "proposed_at": row["proposed_at"],
+        "approved_at": row["approved_at"],
+        "simulated_at": row["simulated_at"],
+        "verified_at": row["verified_at"],
+        "completed_at": row["completed_at"],
+        "simulation": (
+            None if row["simulation_json"] is None else json.loads(row["simulation_json"])
+        ),
+        "verification": (
+            None if row["verification_json"] is None else json.loads(row["verification_json"])
+        ),
+        "rejection_reason": row["rejection_reason"],
+    }
+    return RepairRecord.model_validate(payload)
+
+
+def _optional_datetime(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
 
 
 def _dump(value: Any) -> str:
