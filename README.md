@@ -1,89 +1,99 @@
-Retail Pipeline Guardian
+# Retail Pipeline Guardian
 
-An agentic AI system for investigating retail data-pipeline failures and safely testing repairs. It detects data-quality issues, gathers operational evidence, evaluates possible root causes, proposes constrained fixes, and verifies them against an isolated dataset.
+Retail Pipeline Guardian investigates failures in a synthetic retail data pipeline. Deterministic
+checks detect bad data, then a bounded LangGraph workflow gathers evidence, tracks competing
+hypotheses, and either reports a supported cause or stops inconclusively. A separate agent proposes
+repairs from a restricted operation catalogue. Repairs require human approval, run against an
+isolated dataset copy, and must pass deterministic regression checks before the system recommends
+them.
 
-Built with Python, LangGraph, Pydantic, SQLite, pandas, and Ollama. Runs locally without a paid API key.
+![Retail Pipeline Guardian dashboard overview](docs/screenshots/dashboard-overview.png)
 
-How it works
+## Demonstration
 
-Retail data → Quality checks → Incident
-                                  ↓
-                      Investigation agent
-                    (tools + evidence + hypotheses)
-                                  ↓
-                        Root-cause report
-                                  ↓
-                        Repair-planning agent
-                                  ↓
-                         Human approval
-                                  ↓
-                      Isolated repair simulation
-                                  ↓
-                     Deterministic verification
-                                  ↓
-                       Recommend or reject
+In a verified deterministic run, the pipeline found 10 affected rows representing five duplicated
+order IDs. The investigation collected the validation failure and bounded record samples, then the
+repair planner proposed removing only the repeated copies. After approval, the operation ran on an
+isolated snapshot. Verification confirmed that `unique_order_id` passed, unaffected records were
+preserved, and the repair could be recommended. The original dataset remained unchanged.
 
-The investigation agent chooses read-only tools to inspect supplier submissions, pipeline logs, orchestration events, transformations, and configuration changes. A separate factual verifier prevents unsupported causal claims. The repair agent proposes only approved, parameterised operations. Original data is never modified, and the LLM cannot declare its own repair successful.
+The Streamlit dashboard exposes the same workflow: run a scenario, inspect tool calls and evidence,
+review a repair proposal, approve its simulation, and examine the verification result. Incidents,
+investigations, decisions, evidence, and repair history are persisted in SQLite.
 
-Example
+### Investigation trace
 
-In a reproducible duplicate-record scenario, the investigation identified two accepted submissions with the same supplier batch ID and checksum. The repair workflow proposed deduplication, removed five duplicated records in an isolated simulation (205 → 200), and verified that the uniqueness check passed without introducing new failures. This is a synthetic demonstration, not a production deployment.
+![Evidence-backed investigation trace](docs/screenshots/investigation-trace.png)
 
-Supported simulated repairs:
+### Repair verification
 
-Deduplicate specified transaction IDs.
+![Deterministic repair verification](docs/screenshots/repair-verification.png)
 
-Correct supplier currency using its configured contract.
+## How it works
 
-Activate a category backed by an approved configuration change.
+```mermaid
+flowchart LR
+    A[Supplier data] --> B[Pipeline checks]
+    B -->|incident| C[(SQLite history)]
+    C --> D[LangGraph investigation]
+    D <--> E[Read-only evidence tools]
+    D --> F[Supported conclusion]
+    F --> G[Repair planner]
+    G --> H{Human approval}
+    H --> I[Isolated simulation]
+    I --> J[Deterministic verification]
+```
 
-Quick start (Windows PowerShell)
+Data-quality checks cover schema, uniqueness, nulls, currencies, categories, delivery time, and
+statistical price anomalies. The investigation agent can inspect validation results and operational
+evidence, while the workflow validates tool arguments, evidence references, hypothesis transitions,
+and execution budgets. The repair planner receives only operations valid for the incident and must
+produce typed parameters and verification requirements. The model never decides whether a repair
+passed.
 
-Requires Python 3.12+.
+**Technologies:** Python 3.12, LangGraph, Ollama, Pydantic, SQLite, pandas, Streamlit, and pytest.
 
+## Getting started
+
+From Windows PowerShell:
+
+```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+python -m pip install uv
+uv sync --extra dev --python 3.12
+uv run streamlit run streamlit_app.py
+```
 
-Run a reproducible incident and investigation:
+Open `http://localhost:8501`. The deterministic provider is sufficient for the complete demo;
+Ollama is optional. To use the local model provider, install Ollama and download the configured
+model:
 
-$db = "artifacts\demo.db"
-retail-guardian run --scenario duplicate_records --rows 500 --seed 42 --database $db --output-dir artifacts\demo
-$incident = Get-Content artifacts\demo\duplicate_records-incident.json | ConvertFrom-Json
-$investigation = retail-guardian investigate --provider mock --database $db --incident-id $incident.incident_id | ConvertFrom-Json
+```powershell
+ollama pull qwen3:4b
+```
 
-Propose, approve, and simulate a repair:
+Run the automated checks with:
 
-$repair = retail-guardian propose-repair --provider mock --database $db --investigation-id $investigation.investigation_id | ConvertFrom-Json
-retail-guardian show-repair --database $db --repair-id $repair.repair_id
-retail-guardian approve-repair --database $db --repair-id $repair.repair_id
-retail-guardian simulate-repair --database $db --repair-id $repair.repair_id
-retail-guardian repair-result --database $db --repair-id $repair.repair_id
+```powershell
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+```
 
-The mock provider is a deterministic demonstration/testing provider, not an LLM. For live local reasoning, install Ollama, run ollama pull qwen3:4b, and use --provider ollama --model qwen3:4b for investigation or repair proposals.
+## Evaluation
 
-Evaluation and tests
+The six-scenario regression benchmark measures classification and workflow behaviour for known
+synthetic validation failures; the deterministic baseline resolves all six. It is not a test of
+ambiguous upstream reasoning. A separate ten-case causal benchmark gives multiple plausible causes
+for the same symptom. The recorded `qwen3:4b` baseline reached 22.2% root-cause accuracy, 0% evidence
+support, and 90% workflow completion. The latest isolated live investigation also failed safely
+rather than accepting an unsupported conclusion. The current automated suite contains 147 passing
+tests.
 
-6/6 deterministic incident-regression cases passed with the real local qwen3:4b model in a recorded run. This measures workflow reliability on known incident types, not complex upstream causal reasoning.
+## Limitations
 
-A separate ten-case benchmark tests competing upstream causes and insufficient evidence. Local-model results vary; the initial recorded run achieved 2 correct diagnoses among 9 resolvable attempts, with no evidence-supported conclusions. Subsequent architectural fixes were verified through targeted tests, not a completed repeat of that benchmark.
-
-145 automated tests passed at the Day 4 milestone; subsequent changes should be retested before updating this number.
-
-python -m pytest -W error
-python -m ruff check .
-python -m ruff format --check .
-
-Safety and limitations
-
-Synthetic data and operational logs; SQLite storage is intended for local demonstration.
-
-Repairs run only against isolated snapshots after explicit approval for simulation. No production-apply command exists.
-
-The causal verifier supports nine defined mechanisms, and the repair library supports three operations.
-
-Local LLMs may choose poor tools or fail to reach a supported diagnosis; the system records failures and inconclusive outcomes.
-
-A successful data repair does not necessarily fix the upstream process that introduced the defect.
-
-See the CLI --help commands and source modules under src/retail_guardian/ for the full investigation, benchmark, and repair interfaces.
+The datasets and operational evidence are synthetic. Local-model results vary and smaller models
+can select weak investigation paths or produce invalid structured decisions. Repairs are limited to
+reviewed dataset operations and run only in isolated simulation; the project does not mutate
+production data or repair the upstream infrastructure that caused an incident.

@@ -105,6 +105,14 @@ class HistoryRepository(Protocol):
 
     def get_repair(self, repair_id: str) -> RepairRecord | None: ...
 
+    def list_incidents(self, *, limit: int = 50) -> list[dict[str, Any]]: ...
+
+    def list_investigation_sessions(self, *, limit: int = 50) -> list[dict[str, Any]]: ...
+
+    def list_repairs(
+        self, *, investigation_id: str | None = None, limit: int = 50
+    ) -> list[RepairRecord]: ...
+
 
 class SQLiteHistoryRepository:
     """SQLite implementation that stores profiles and evidence, not full datasets."""
@@ -793,6 +801,69 @@ class SQLiteHistoryRepository:
                 for row in events
             ],
         }
+
+    def list_incidents(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT i.incident_id, i.execution_id, i.observable_report_json, i.created_at,
+                          p.status AS execution_status, p.pipeline_stage,
+                          p.ingestion_timestamp, p.row_count
+                   FROM incident i
+                   JOIN pipeline_execution p ON p.execution_id = i.execution_id
+                   ORDER BY i.created_at DESC LIMIT ?""",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [
+            {
+                "incident_id": row["incident_id"],
+                "execution_id": row["execution_id"],
+                "created_at": row["created_at"],
+                "ingestion_timestamp": row["ingestion_timestamp"],
+                "execution_status": row["execution_status"],
+                "pipeline_stage": row["pipeline_stage"],
+                "row_count": row["row_count"],
+                "report": json.loads(row["observable_report_json"]),
+            }
+            for row in rows
+        ]
+
+    def list_investigation_sessions(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT investigation_id, incident_id, status, started_at,
+                          completed_at, report_json
+                   FROM investigation_session
+                   ORDER BY started_at DESC LIMIT ?""",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [
+            {
+                "investigation_id": row["investigation_id"],
+                "incident_id": row["incident_id"],
+                "status": row["status"],
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "report": json.loads(row["report_json"]) if row["report_json"] else None,
+            }
+            for row in rows
+        ]
+
+    def list_repairs(
+        self,
+        *,
+        investigation_id: str | None = None,
+        limit: int = 50,
+    ) -> list[RepairRecord]:
+        query = "SELECT * FROM repair_session"
+        parameters: list[Any] = []
+        if investigation_id is not None:
+            query += " WHERE investigation_id = ?"
+            parameters.append(investigation_id)
+        query += " ORDER BY proposed_at DESC LIMIT ?"
+        parameters.append(max(1, min(limit, 500)))
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_repair_record(row) for row in rows]
 
     def get_investigations(self, incident_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
